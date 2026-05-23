@@ -189,11 +189,31 @@ def _run_jira_search(user_question: str) -> tuple[str, str]:
     except Exception as exc:
         return f"Jira search failed: {exc}", "The Jira tool raised an unexpected error."
 
-    result_text = str(tool_result.get("result") or "")
-    if not result_text.strip():
-        result_text = "No Jira tickets found for the query."
-
+    result_text = str(tool_result.get("result") or "").strip()
     route_reason = "Jira search executed because the turn was classified as ticketing/workflow related."
+
+    if not tool_result.get("ok", False):
+        error_text = str(tool_result.get("error") or "Jira search failed.").strip()
+        if not error_text:
+            error_text = "Jira search failed."
+        return error_text, "Jira search did not complete successfully."
+
+    if not result_text:
+        return (
+            "I could not find a Jira match yet. Try including a project, ticket key, status, or team name.",
+            "Jira search returned no result text.",
+        )
+
+    no_match_markers = (
+        "No Jira tickets found for query:",
+        "No Jira tickets found for the query.",
+    )
+    if any(marker in result_text for marker in no_match_markers):
+        return (
+            "I could not find a strong Jira match yet. Try adding a project key, ticket status, assignee/team, or exact ticket keyword.",
+            "Jira search returned no strong matches, so the backend is asking for a more specific ticket query.",
+        )
+
     return result_text, route_reason
 
 
