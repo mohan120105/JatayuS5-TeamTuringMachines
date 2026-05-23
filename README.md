@@ -1,5 +1,10 @@
 # Sentinel GraphRAG: Enterprise Conversational AI for Banking Compliance
 
+## Try it live
+
+- Frontend: https://sentinel-ui-orpin.vercel.app/
+- Backend API: https://sentinel-hybridrag.onrender.com
+
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Neo4j](https://img.shields.io/badge/Neo4j-Graph%20Database-blue)
 ![LangChain](https://img.shields.io/badge/LangChain-Framework-green)
@@ -9,6 +14,26 @@
 ![Streamlit](https://img.shields.io/badge/Streamlit-Web%20UI-FF4B4B)
 
 **Sentinel GraphRAG** is a production-grade conversational AI system for banking policy compliance. It combines multimodal document ingestion, hybrid vector + keyword retrieval, Neo4j graph governance, multilingual support, and deterministic audit trails to deliver hallucination-resistant, compliance-aware Q&A with full regulatory traceability.
+
+## Why GraphRAG Over Standard RAG
+
+Standard RAG can surface the wrong answer when multiple policy versions, overlapping clauses, and bank-specific access rules exist at the same time. Sentinel adds a Neo4j governance layer so the system can filter superseded policies, preserve document lineage, and answer with the current approved rule instead of a semantically similar but stale document.
+
+That graph layer is the differentiator: policy nodes, customer-type edges, document requirements, and access control all work together before the model synthesizes the final answer. The result is more reliable than flat retrieval when a compliance question depends on versioning, tier-based access, or multi-hop context.
+
+## Live Deployment & Evidence
+
+- Frontend demo: https://sentinel-ui-orpin.vercel.app/
+- Backend API: https://sentinel-hybridrag.onrender.com
+- Neo4j AuraDB: add your Aura connection screenshot and connection details here
+- HuggingFace prompt modifier: https://huggingface.co/spaces/mohan1201/sentinel-gemma-router
+- HuggingFace multilingual embeddings: https://huggingface.co/spaces/mohan1201/sentinel-embedding-server
+
+Suggested proof points for judges:
+
+- Architecture diagram image: add one in `docs/` or `img_data/` and reference it here.
+- Demo GIF or screenshot: add a chat capture showing a compliance query and the routed answer.
+- Neo4j AuraDB screenshot: show the database endpoint / connection screen and optionally a query result from the active policy graph.
 
 ## The Challenge: Enterprise RAG for Regulated Domains
 
@@ -249,6 +274,8 @@ Create a `.env` file in the project root with all required keys (add frontend ke
 
 ```dotenv
 # Neo4j Graph Database
+# For Neo4j AuraDB, use the secure URI format shown in your Aura console:
+# NEO4J_URI=neo4j+s://<your-database-id>.databases.neo4j.io
 NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_neo4j_password
