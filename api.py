@@ -55,6 +55,12 @@ from query_copilot import (
 )
 
 try:
+    from tool_registry import default_registry as _tool_registry
+except Exception as _tool_registry_error:
+    print(f"[WARNING] tool_registry not loaded: {_tool_registry_error}")
+    _tool_registry = None
+
+try:
     from prompt_modifier import enhance_query_for_graphrag
 except Exception as _pm_err:
     print(f"[WARNING] prompt_modifier not loaded: {_pm_err}")
@@ -98,6 +104,97 @@ GITHUB_POLICY_MANIFEST_PATH = os.getenv(
     "GITHUB_POLICY_MANIFEST_PATH",
     "policy_access_manifest.json",
 ).strip().strip("/")
+
+JIRA_ROUTE_KEYWORDS = {
+    "jira",
+    "ticket",
+    "tickets",
+    "issue",
+    "issues",
+    "bug",
+    "bugs",
+    "incident",
+    "incidents",
+    "task",
+    "tasks",
+    "story",
+    "stories",
+    "epic",
+    "sprint",
+    "assignee",
+    "assigned",
+    "status",
+    "priority",
+    "backlog",
+    "workflow",
+    "resolve",
+    "resolved",
+    "blocked",
+    "blocker",
+}
+
+GRAPH_RAG_ROUTE_KEYWORDS = {
+    "policy",
+    "policies",
+    "compliance",
+    "kyc",
+    "aml",
+    "rbi",
+    "customer",
+    "onboarding",
+    "document",
+    "documents",
+    "eligibility",
+    "rule",
+    "rules",
+    "guideline",
+    "guidelines",
+    "threshold",
+    "limits",
+    "loan",
+    "account",
+    "transaction",
+    "transactions",
+}
+
+
+def _classify_chat_route(user_question: str) -> tuple[str, str]:
+    """Classify a turn as GraphRAG or Jira before executing the answer path."""
+
+    question = (user_question or "").strip().lower()
+    if not question:
+        return "graphrag", "Empty questions default to the GraphRAG policy path."
+
+    jira_hits = sum(1 for keyword in JIRA_ROUTE_KEYWORDS if keyword in question)
+    graph_hits = sum(1 for keyword in GRAPH_RAG_ROUTE_KEYWORDS if keyword in question)
+
+    if jira_hits > graph_hits and jira_hits > 0:
+        return "jira", "The input mentions ticketing or issue-management terms."
+    if graph_hits > jira_hits and graph_hits > 0:
+        return "graphrag", "The input mentions policy, compliance, or banking rule terms."
+
+    if jira_hits > 0:
+        return "jira", "The input resembles a ticketing or workflow query."
+    return "graphrag", "Defaulting to the verified policy GraphRAG path."
+
+
+def _run_jira_search(user_question: str) -> tuple[str, str]:
+    """Search Jira through the registered tool layer and return formatted output."""
+
+    if _tool_registry is None:
+        return "Jira tool is unavailable on this server.", "Jira integration is not loaded."
+
+    try:
+        tool_result = _tool_registry.execute_tool("search_jira_tickets", {"query": user_question})
+    except Exception as exc:
+        return f"Jira search failed: {exc}", "The Jira tool raised an unexpected error."
+
+    result_text = str(tool_result.get("result") or "")
+    if not result_text.strip():
+        result_text = "No Jira tickets found for the query."
+
+    route_reason = "Jira search executed because the turn was classified as ticketing/workflow related."
+    return result_text, route_reason
 
 
 def _collect_followup_topic_catalog(driver: Driver, user_tier: int, limit: int = 12) -> str:
@@ -410,7 +507,7 @@ def _validate_followup_suggestion(
             question_embedding,
             top_k=3,
             user_tier=user_tier,
-            similarity_threshold=0.3,
+            similarity_threshold=0.5,
         )
     except Exception as exc:
         print(f"[WARNING] Follow-up validation failed for '{normalized_suggestion}': {exc}")
@@ -673,6 +770,8 @@ class ChatResponse(BaseModel):
     retrieval_tier: str = Field(default="no_match")
     sentinel_reasoning: str = Field(default="")
     followup_suggestions: List[str] = Field(default_factory=list)
+    route_source: str = Field(default="graphrag")
+    route_reason: str = Field(default="")
 
     @model_validator(mode="after")
     def compute_match_confidence(self) -> "ChatResponse":
@@ -728,6 +827,8 @@ class SessionMessage(BaseModel):
     graph_edges: List[SessionGraphEdge] = Field(default_factory=list)
     retrieval_tier: str | None = None
     sentinel_reasoning: str | None = None
+    route_source: str | None = None
+    route_reason: str | None = None
 
 
 class PolicyRepositoryItem(BaseModel):
@@ -1182,6 +1283,8 @@ def _save_messages_tx(
     user_tier: int | None = None,
     retrieval_tier: str | None = None,
     sentinel_reasoning: str | None = None,
+    route_source: str | None = None,
+    route_reason: str | None = None,
     interrupted: bool = False,
 ) -> None:
     """Persist a completed turn as session-scoped Neo4j Message nodes.
@@ -1226,7 +1329,7 @@ def _save_messages_tx(
         FOREACH (_ IN CASE WHEN $enhanced_prompt IS NOT NULL THEN [1] ELSE [] END |
             SET u.enhanced_prompt = $enhanced_prompt
         )
-        CREATE (a:Message {role: 'assistant', content: $answer,   timestamp: $ts_asst, citations: $citations_json, tier: $user_tier, retrieval_tier: $retrieval_tier, sentinel_reasoning: $sentinel_reasoning, status: $assistant_status})
+        CREATE (a:Message {role: 'assistant', content: $answer,   timestamp: $ts_asst, citations: $citations_json, tier: $user_tier, retrieval_tier: $retrieval_tier, sentinel_reasoning: $sentinel_reasoning, route_source: $route_source, route_reason: $route_reason, status: $assistant_status})
         CREATE (s)-[:CONTAINS_MESSAGE]->(u)
         CREATE (s)-[:CONTAINS_MESSAGE]->(a)
         """,
@@ -1238,6 +1341,8 @@ def _save_messages_tx(
         user_tier=user_tier,
         retrieval_tier=retrieval_tier,
         sentinel_reasoning=sentinel_reasoning,
+        route_source=route_source,
+        route_reason=route_reason,
         assistant_status=assistant_status,
         ts_user=ts_user,
         ts_asst=ts_asst,
@@ -1345,6 +1450,8 @@ def _fetch_session_messages_tx(
                 "citations": [],
                 "retrieval_tier": record.get("retrieval_tier"),
                 "sentinel_reasoning": record.get("sentinel_reasoning"),
+                "route_source": record.get("route_source"),
+                "route_reason": record.get("route_reason"),
             }
             
             # Recompute confidence from raw score at read time so UI evidence
@@ -2024,6 +2131,16 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     driver = _get_driver()
     llm = _get_llm()
     embeddings = _get_embeddings()
+    route_source = "graphrag"
+    route_reason = "Defaulting to the verified policy GraphRAG path."
+    followup_suggestions: List[str] = []
+    citations: List[Citation] = []
+    graph_nodes: List[GraphNode] = []
+    graph_edges: List[GraphEdge] = []
+    answer = ""
+    sentinel_reasoning = ""
+    retrieval_tier = "no_match"
+    interrupted = False
 
     try:
         # COMPLIANCE CRITICAL: Start a disconnect watcher immediately so a user
@@ -2051,92 +2168,108 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             graph_edges = []
             followup_suggestions = []
         else:
-            # COMPLIANCE CRITICAL: Retrieval must stay fully grounded before any
-            # response is emitted. The hybrid search path combines lexical and
-            # vector evidence, then applies GLAC and policy access filtering.
-            try:
-                question_embedding = embeddings.embed_query(f"query: {user_question}")
-            except Exception as exc:
-                # Embedding failures (network, auth, model errors) should return a
-                # controlled 503 to the client rather than raising an uncaught 500.
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Embedding service unavailable: {exc}",
-                ) from exc
+            route_source, route_reason = _classify_chat_route(user_question)
 
-            active_context = retrieve_active_policy(
-                driver,
-                user_question,
-                question_embedding,
-                user_tier=user_tier,
-            )
-
-            # SECURITY GUARDRAIL: The answer generator is invoked only after the
-            # retrieval tier is known, so the turn can be treated as no-match,
-            # partial, exact, or interrupted in a deterministic way.
-            retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
-            classification_tier = retrieval_tier
-
-            # Detect the operator language early so both synthesis and follow-up
-            # guidance remain aligned to the same multilingual audit trail.
-            detected_language = detect_user_language(user_question)
-
-            if user_tier != 1 and not active_context:
-                answer = RBAC_DENIAL_MESSAGE
-                sentinel_reasoning = RBAC_DENIAL_MESSAGE
-                retrieval_tier = "access_denied"
-                interrupted = False
-            else:
-                answer, sentinel_reasoning, interrupted = await run_in_threadpool(
-                    _generate_with_history,
-                    llm,
-                    active_context,
-                    user_question,
-                    history,
-                    retrieval_tier,
-                    detected_language,
-                    stop_event,
-                )
-
-            if stop_event.is_set() or interrupted:
-                retrieval_tier = "interrupted"
-                answer = STOP_GENERATION_MESSAGE
-                sentinel_reasoning = STOP_GENERATION_MESSAGE
-
-            followup_suggestions = []
-            if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match" and not stop_event.is_set():
-                try:
-                    followup_suggestions = _build_followup_suggestions(
-                        driver,
-                        llm,
-                        embeddings,
-                        user_question,
-                        answer,
-                        active_context,
-                        detected_language,
-                        user_tier,
-                        True,
-                    )
-                except Exception as exc:
-                    print(f"[WARNING] Follow-up suggestion path failed safely: {exc}")
-
-            # COMPLIANCE CRITICAL: No-match, denied, or interrupted turns must
-            # not expose evidence objects. Empty citations prevent speculative
-            # evidence from being rendered as if it were verified policy truth.
-            if retrieval_tier in {"no_match", "access_denied", "interrupted"} or not active_context or answer == STRICT_NO_ANSWER:
+            if route_source == "jira":
+                answer, route_reason = await run_in_threadpool(_run_jira_search, user_question)
+                active_context = []
                 citations = []
                 graph_nodes = []
                 graph_edges = []
+                retrieval_tier = "tool_call"
+                sentinel_reasoning = route_reason
+                classification_tier = retrieval_tier
+                interrupted = False
+                followup_suggestions = []
             else:
-                citations = [
-                    Citation(
-                        document_name=p.document_name,
-                        category=p.category,
-                        raw_score=float(p.score),
+                # COMPLIANCE CRITICAL: Retrieval must stay fully grounded before any
+                # response is emitted. The hybrid search path combines lexical and
+                # vector evidence, then applies GLAC and policy access filtering.
+                try:
+                    question_embedding = embeddings.embed_query(f"query: {user_question}")
+                except Exception as exc:
+                    # Embedding failures (network, auth, model errors) should return a
+                    # controlled 503 to the client rather than raising an uncaught 500.
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Embedding service unavailable: {exc}",
+                    ) from exc
+
+                active_context = retrieve_active_policy(
+                    driver,
+                    user_question,
+                    question_embedding,
+                    user_tier=user_tier,
+                )
+
+                # SECURITY GUARDRAIL: The answer generator is invoked only after the
+                # retrieval tier is known, so the turn can be treated as no-match,
+                # partial, exact, or interrupted in a deterministic way.
+                retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
+                classification_tier = retrieval_tier
+
+                # Detect the operator language early so both synthesis and follow-up
+                # guidance remain aligned to the same multilingual audit trail.
+                detected_language = detect_user_language(user_question)
+
+                if user_tier != 1 and not active_context:
+                    answer = RBAC_DENIAL_MESSAGE
+                    sentinel_reasoning = RBAC_DENIAL_MESSAGE
+                    retrieval_tier = "access_denied"
+                    interrupted = False
+                else:
+                    answer, sentinel_reasoning, interrupted = await run_in_threadpool(
+                        _generate_with_history,
+                        llm,
+                        active_context,
+                        user_question,
+                        history,
+                        retrieval_tier,
+                        detected_language,
+                        stop_event,
                     )
-                    for p in active_context
-                ]
-                graph_nodes, graph_edges = _build_evidence_graph(active_context)
+
+                if stop_event.is_set() or interrupted:
+                    retrieval_tier = "interrupted"
+                    answer = STOP_GENERATION_MESSAGE
+                    sentinel_reasoning = STOP_GENERATION_MESSAGE
+
+                followup_suggestions = []
+                if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match" and not stop_event.is_set():
+                    try:
+                        followup_suggestions = _build_followup_suggestions(
+                            driver,
+                            llm,
+                            embeddings,
+                            user_question,
+                            answer,
+                            active_context,
+                            detected_language,
+                            user_tier,
+                            True,
+                        )
+                    except Exception as exc:
+                        print(f"[WARNING] Follow-up suggestion path failed safely: {exc}")
+
+                # COMPLIANCE CRITICAL: No-match, denied, or interrupted turns must
+                # not expose evidence objects. Empty citations prevent speculative
+                # evidence from being rendered as if it were verified policy truth.
+                if retrieval_tier in {"no_match", "access_denied", "interrupted"} or not active_context or answer == STRICT_NO_ANSWER:
+                    citations = []
+                    graph_nodes = []
+                    graph_edges = []
+                else:
+                    citations = [
+                        Citation(
+                            document_name=p.document_name,
+                            category=p.category,
+                            raw_score=float(p.score),
+                        )
+                        for p in active_context
+                    ]
+                    graph_nodes, graph_edges = _build_evidence_graph(active_context)
+
+                route_source = route_source or "graphrag"
 
             # ── Step 5: Persist the new turn to Neo4j with citations (non-fatal on failure) ──────────
             try:
@@ -2151,6 +2284,8 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
                         user_tier,
                         retrieval_tier,
                         sentinel_reasoning,
+                        route_source,
+                        route_reason,
                         stop_event.is_set() or interrupted,
                     )
             except (Neo4jError, ServiceUnavailable) as exc:
@@ -2168,6 +2303,8 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             retrieval_tier=retrieval_tier,
             sentinel_reasoning=sentinel_reasoning,
             followup_suggestions=followup_suggestions,
+            route_source=route_source,
+            route_reason=route_reason,
         )
     finally:
         stop_event.set()
