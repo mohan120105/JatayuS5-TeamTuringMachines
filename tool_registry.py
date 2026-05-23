@@ -134,6 +134,130 @@ def _escape_atlassian_query(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+_JIRA_STOPWORDS = {
+    "show",
+    "me",
+    "find",
+    "give",
+    "all",
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "for",
+    "related",
+    "relateds",
+    "relatedto",
+    "about",
+    "please",
+    "tickets",
+    "ticket",
+    "issue",
+    "issues",
+    "open",
+    "opened",
+    "assigned",
+    "assign",
+    "assignment",
+    "are",
+    "is",
+    "with",
+    "team",
+    "teams",
+    "assigned",
+    "assign",
+    "assignedto",
+}
+
+
+def _build_jira_jql(query: str) -> str:
+    """Convert a natural-language ticket query into a compact JQL expression."""
+
+    normalized = (query or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", normalized)
+    tokens = [token for token in cleaned.split() if token and token not in _JIRA_STOPWORDS]
+
+    jql_clauses: list[str] = []
+
+    if any(token in {"open", "opened", "active", "pending"} for token in normalized.split()):
+        jql_clauses.append("statusCategory != Done")
+
+    if any(token in {"closed", "done", "resolved", "completed"} for token in normalized.split()):
+        jql_clauses.append("statusCategory = Done")
+
+    if "payments team" in normalized or "payment team" in normalized or "payments" in tokens:
+        jql_clauses.append('labels = "payments" OR text ~ "payments"')
+
+    if "kyc" in tokens or "onboarding" in tokens:
+        jql_clauses.append('text ~ "KYC" OR text ~ "onboarding" OR labels = "kyc"')
+
+    if any(token in {"fraud", "aml", "compliance", "dispute", "incident", "bug"} for token in tokens):
+        focused_tokens = [token for token in tokens if token not in {"fraud", "aml", "compliance", "dispute", "incident", "bug"}]
+        if focused_tokens:
+            token_clause = " AND ".join(f'text ~ "{_escape_atlassian_query(token)}"' for token in focused_tokens[:4])
+            jql_clauses.append(token_clause)
+        jql_clauses.append("text ~ \"fraud\" OR text ~ \"aml\" OR text ~ \"compliance\" OR text ~ \"dispute\" OR text ~ \"incident\" OR text ~ \"bug\"")
+
+    for token in tokens[:5]:
+        jql_clauses.append(f'text ~ "{_escape_atlassian_query(token)}"')
+
+    if not jql_clauses:
+        jql_clauses.append(f'text ~ "{_escape_atlassian_query(query)}"')
+
+    # De-duplicate while preserving order.
+    deduped_clauses: list[str] = []
+    seen = set()
+    for clause in jql_clauses:
+        key = clause.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_clauses.append(clause)
+
+    return " AND ".join(f"({clause})" for clause in deduped_clauses)
+
+
+def _build_jira_fallback_jql(query: str) -> str:
+    """Build a broader Jira query that favors recall over precision."""
+
+    normalized = (query or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9\s_-]+", " ", normalized)
+    tokens = [token for token in cleaned.split() if token and token not in _JIRA_STOPWORDS]
+
+    clauses: list[str] = []
+
+    if any(token in {"open", "opened", "active", "pending"} for token in tokens):
+        clauses.append("statusCategory != Done")
+
+    if any(token in {"closed", "done", "resolved", "completed"} for token in tokens):
+        clauses.append("statusCategory = Done")
+
+    if tokens:
+        text_clauses = [f'text ~ "{_escape_atlassian_query(token)}"' for token in tokens[:6]]
+        clauses.append(" OR ".join(text_clauses))
+
+    if "payments" in tokens or "payment" in tokens:
+        clauses.append('labels = "payments" OR text ~ "payments" OR text ~ "payment"')
+
+    if "kyc" in tokens or "onboarding" in tokens:
+        clauses.append('text ~ "KYC" OR text ~ "onboarding" OR labels = "kyc"')
+
+    if not clauses:
+        clauses.append(f'text ~ "{_escape_atlassian_query(query)}"')
+
+    deduped: list[str] = []
+    seen = set()
+    for clause in clauses:
+        key = clause.lower().strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(clause)
+
+    return " AND ".join(f"({clause})" for clause in deduped)
+
+
 class ToolRegistry:
     """Registry for callable tools and their generated JSON schemas."""
 
@@ -399,13 +523,24 @@ def search_jira_tickets(query: str) -> str:
 
     try:
         jira = JIRA(server=jira_server, basic_auth=(jira_user, jira_token))
-        jql = f'text ~ "{_escape_atlassian_query(query)}" ORDER BY updated DESC'
-        issues = jira.search_issues(jql, maxResults=3)
+        strict_jql = _build_jira_jql(query) + " ORDER BY updated DESC"
+        issues = jira.search_issues(strict_jql, maxResults=5)
+
+        used_jql = strict_jql
 
         if not issues:
-            return f'No Jira tickets found for query: "{query}".'
+            fallback_jql = _build_jira_fallback_jql(query) + " ORDER BY updated DESC"
+            fallback_issues = jira.search_issues(fallback_jql, maxResults=5)
+            if fallback_issues:
+                issues = fallback_issues
+                used_jql = fallback_jql
+
+        if not issues:
+            return f'No Jira tickets found for query: "{query}". Tried JQL: {strict_jql}'
 
         lines = [f'Jira results for "{query}":']
+        if used_jql != strict_jql:
+            lines.append(f"- Note: used relaxed search because exact match was empty.")
         for issue in issues[:3]:
             summary = getattr(issue.fields, "summary", "No summary available")
             status = getattr(getattr(issue.fields, "status", None), "name", "Unknown")
