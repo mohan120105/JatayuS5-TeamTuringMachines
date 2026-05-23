@@ -1,6 +1,6 @@
 # Sentinel GraphRAG: Enterprise Conversational AI for Banking Compliance
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![Neo4j](https://img.shields.io/badge/Neo4j-Graph%20Database-blue)
 ![LangChain](https://img.shields.io/badge/LangChain-Framework-green)
 ![Groq](https://img.shields.io/badge/Groq-Llama--3.3-black)
@@ -193,12 +193,14 @@ sentinel-graphrag/
 | **app.py**           | Streamlit UI          | Session management, document upload, policy exploration                               |
 | **seed_database.py** | Baseline ingestion    | Automated baseline policy seeding via Gemini + Pydantic                               |
 | **connect.py**       | Neo4j factory         | `build_neo4j_driver()` (connection management)                                      |
+| **tool_registry.py** | Tool registry         | `register_tool()`, `get_tool_schemas()`, `execute_tool()` — registers tool-callable helpers (Jira/Confluence) |
+| **create_jira_issue.py / bulk_create_jira_issues.py / simulate_jira_agent.py** | Jira helpers | Demo/import helpers for creating and simulating Jira tickets used in demos |
 
 ## Quickstart
 
 ### Prerequisites
 
-- **Python 3.10+**
+- **Python 3.11**
 - **Neo4j** (local or cloud instance)
 - **API Keys** (free tier available):
   - Groq (for Llama-3.3-70b inference): [console.groq.com](https://console.groq.com)
@@ -208,9 +210,16 @@ sentinel-graphrag/
 
 ### 1. Clone & Setup Environment
 
+This repository is split between a backend FastAPI service and a separate frontend Vite React repo. Clone both as needed:
+
 ```bash
-git clone https://github.com/mohan1201/sentinel-graphrag.git
-cd sentinel-graphrag
+# Backend (control plane, ingestion, retrieval)
+git clone https://github.com/mohan120105/JatayuS5-TuringMachines.git backend
+
+# Frontend (Vite + React UI) - nested repo maintained separately
+git clone https://github.com/mohan120105/sentinel-ui.git frontend
+
+cd backend
 python -m venv venv
 ```
 
@@ -236,7 +245,7 @@ pip install -r requirements.txt
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the project root with all required keys:
+Create a `.env` file in the project root with all required keys (add frontend keys in `frontend/.env` if used):
 
 ```dotenv
 # Neo4j Graph Database
@@ -270,12 +279,48 @@ GITHUB_TOKEN=your_github_pat_token
 GITHUB_DOCS_ROOT=hackathon-docs
 GITHUB_POLICY_MANIFEST_PATH=policy_access_manifest.json
 
+# Jira / Atlassian credentials (optional — required if you enable Jira/Confluence tools)
+JIRA_SERVER=https://your-jira-instance.atlassian.net
+ATLASSIAN_USER_EMAIL=your-email@example.com
+ATLASSIAN_API_TOKEN=your_atlassian_api_token
+# Optional Confluence settings
+CONFLUENCE_BASE_URL=https://your-confluence.atlassian.net
+CONFLUENCE_API_TOKEN=your_confluence_api_token
+
 # Feature Flags
 ENABLE_FOLLOWUP_SUGGESTIONS=true
 
 # Language Detection Model (auto-discovered if missing)
 FASTTEXT_LANG_MODEL=./models/lid.176.ftz
 ```
+
+### Frontend Quickstart & Notable Dependencies
+
+If you plan to run the optional Vite React frontend, follow these steps from the repository root:
+
+```bash
+cd frontend
+npm install
+# Development server
+npm run dev
+# Or production build
+npm run build
+```
+
+Note: the `frontend/` directory is a separate Git repository (`sentinel-ui`). Do not accidentally push backend-only changes into the frontend repo. When building locally, avoid committing the Vite cache (`node_modules/.vite`) — commit `dist/` only if you intend to serve the prebuilt static assets from the repo.
+
+Additional Python packages to ensure are present in `requirements.txt` for the current system:
+
+- `pydantic>=2.0`
+- `atlassian-python-api` (Confluence helper)
+- `jira` (JIRA API helper)
+
+Key tooling & helper scripts added in this codebase:
+
+- `tool_registry.py` — function-calling registry used by the backend; registers tools like Jira/Confluence and provides `execute_tool()` and JSON-schema generation for tools.
+- `create_jira_issue.py`, `bulk_create_jira_issues.py`, `simulate_jira_agent.py` — helper scripts to create/import and simulate Jira demo data for demos and testing.
+
+API behavior note: `/chat` requests may now route to an internal Jira tool (for ticket lookups) or to the GraphRAG retrieval path. Responses include `route_source` and `route_reason` metadata and the frontend now exposes a dedicated Jira tab for routed ticket results.
 
 ### 3. Bootstrap Neo4j Database
 
