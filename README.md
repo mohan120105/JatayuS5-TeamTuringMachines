@@ -29,11 +29,20 @@ That graph layer is the differentiator: policy nodes, customer-type edges, docum
 - HuggingFace prompt modifier: https://huggingface.co/spaces/mohan1201/sentinel-gemma-router
 - HuggingFace multilingual embeddings: https://huggingface.co/spaces/mohan1201/sentinel-embedding-server
 
-Suggested proof points for judges:
 
-- Architecture diagram image: add one in `docs/` or `img_data/` and reference it here.
-- Demo GIF or screenshot: add a chat capture showing a compliance query and the routed answer.
-- Neo4j AuraDB screenshot: show the database endpoint / connection screen and optionally a query result from the active policy graph.
+# Archecture Diagram
+<img width="2816" height="1536" alt="Gemini_Generated_Image_fgs6jzfgs6jzfgs6" src="https://github.com/user-attachments/assets/b6530821-0675-4781-abaa-ad00186a70f5" />
+
+# UI Screen shots
+  <img width="1918" height="967" alt="image" src="https://github.com/user-attachments/assets/f906c5d8-40a3-4ad8-bdbb-a925ae0c2722" />
+  <img width="1912" height="972" alt="image" src="https://github.com/user-attachments/assets/e299a7e3-18fd-482c-b5c2-70a01d6a6b3e" />
+  <img width="1912" height="976" alt="image" src="https://github.com/user-attachments/assets/ff0a0a79-7d23-4ec0-8c70-3e615ab2b43b" />
+
+
+
+# Knowledge Base Visualization
+  <img width="838" height="622" alt="visualisation (1)" src="https://github.com/user-attachments/assets/86e6a9c2-8993-4b0f-8768-f6bca07fa4d1" />
+
 
 ## The Challenge: Enterprise RAG for Regulated Domains
 
