@@ -830,6 +830,21 @@ class UploadResponse(BaseModel):
     extracted_rule: str
 
 
+class IngestPreviewResponse(BaseModel):
+    message: str
+    document_name: str
+    extracted_action: GraphAction
+
+
+class IngestConfirmRequest(BaseModel):
+    employee_id: str
+    access_code: int
+    document_name: str
+    extracted_action: GraphAction
+    issue_date: str | None = None
+    source_text: str | None = None
+
+
 class SessionSummary(BaseModel):
     session_id: str
     session_name: str
@@ -2424,4 +2439,124 @@ async def ingest_document(
         raise HTTPException(
             status_code=500,
             detail=f"Document ingestion failed: {exc}",
+        ) from exc
+
+
+@app.post("/ingest/preview", response_model=IngestPreviewResponse)
+@app.post("/upload/preview", response_model=IngestPreviewResponse)
+async def preview_ingest_document(
+    file: UploadFile = File(...),
+    employee_id: str = Form(...),
+    access_code: int = Form(...),
+) -> IngestPreviewResponse:
+    """Extract a draft GraphAction for human review before ingestion."""
+
+    filename = (file.filename or "uploaded_document").strip()
+    if not filename:
+        raise HTTPException(status_code=422, detail="Uploaded file must have a name.")
+
+    employee_id = employee_id.strip()
+    if not employee_id:
+        raise HTTPException(status_code=422, detail="employee_id must not be empty.")
+
+    user_tier = get_user_tier(employee_id)
+    if user_tier == 3:
+        raise HTTPException(
+            status_code=403,
+            detail="Viewers are not permitted to ingest documents.",
+        )
+
+    if access_code not in {1, 2}:
+        raise HTTPException(
+            status_code=422,
+            detail="access_code must be 1 for Confidential or 2 for General.",
+        )
+
+    mime_type = _validate_upload_type(file)
+
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+
+        action = await run_in_threadpool(
+            _extract_graph_action_from_upload,
+            file_bytes,
+            filename,
+            mime_type,
+        )
+
+        return IngestPreviewResponse(
+            message="Draft extraction completed. Review and confirm to ingest.",
+            document_name=filename,
+            extracted_action=action,
+        )
+    except HTTPException:
+        raise
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Schema validation failed during draft extraction: {exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document preview failed: {exc}",
+        ) from exc
+
+
+@app.post("/ingest/confirm", response_model=UploadResponse)
+@app.post("/upload/confirm", response_model=UploadResponse)
+async def confirm_ingest_document(payload: IngestConfirmRequest) -> UploadResponse:
+    """Persist a user-approved draft extraction into Neo4j."""
+
+    employee_id = payload.employee_id.strip()
+    if not employee_id:
+        raise HTTPException(status_code=422, detail="employee_id must not be empty.")
+
+    user_tier = get_user_tier(employee_id)
+    if user_tier == 3:
+        raise HTTPException(
+            status_code=403,
+            detail="Viewers are not permitted to ingest documents.",
+        )
+
+    if payload.access_code not in {1, 2}:
+        raise HTTPException(
+            status_code=422,
+            detail="access_code must be 1 for Confidential or 2 for General.",
+        )
+
+    document_name = payload.document_name.strip()
+    if not document_name:
+        raise HTTPException(status_code=422, detail="document_name must not be empty.")
+
+    action = payload.extracted_action
+    issue_date = (payload.issue_date or datetime.utcnow().date().isoformat()).strip()
+    source_text = (payload.source_text or f"Human-approved ingestion from {document_name}.").strip()
+
+    try:
+        await run_in_threadpool(
+            _ingest_graph_action_to_neo4j,
+            action,
+            document_name,
+            issue_date,
+            source_text,
+            payload.access_code,
+        )
+
+        return UploadResponse(
+            message="Document ingested successfully after human confirmation.",
+            document_name=document_name,
+            extracted_rule=action.extracted_rule,
+        )
+    except (Neo4jError, ServiceUnavailable) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Neo4j ingestion failed: {exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document confirmation failed: {exc}",
         ) from exc

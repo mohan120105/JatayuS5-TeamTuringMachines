@@ -58,7 +58,7 @@ Sentinel implements a **three-layer retrieval engine** with governance enforceme
 
 1. **Vector Search** (HuggingFace Embedding Space): Captures semantic intent via `paraphrase-multilingual-MiniLM-L12-v2` (384-dim vectors)
 2. **Full-Text Search** (Neo4j BM25 Index): Boosts exact keyword + identifier matches (policy names, acronyms like "KYC", "TDS")
-3. **Hybrid Score Fusion**: `combined_score = vector_score + (BM25_score / 10.0)` for balanced relevance
+3. **Hybrid Score Fusion**: Reciprocal Rank Fusion (RRF) over vector and BM25 ranks for balanced relevance
 4. **GLAC Access Control**: `WHERE ($user_tier = 1 OR p.access_code = 2)` enforces tier-based policy access
 5. **Version Governance**: `WHERE NOT ()-[:SUPERSEDES]->(p)` filters active policies only
 6. **Multi-Hop Resolution**: :BELONGS_TO, :APPLIES_TO, :REQUIRES edges provide customer segment + document context
@@ -332,7 +332,7 @@ FASTTEXT_LANG_MODEL=./models/lid.176.ftz
 
 ### Frontend Quickstart & Notable Dependencies
 
-If you plan to run the optional Vite React frontend, follow these steps from the repository root:
+If you plan to run the Vite React frontend, follow these steps from the repository root:
 
 ```bash
 cd frontend
@@ -343,7 +343,7 @@ npm run dev
 npm run build
 ```
 
-Note: the `frontend/` directory is a separate Git repository (`sentinel-ui`). Do not accidentally push backend-only changes into the frontend repo. When building locally, avoid committing the Vite cache (`node_modules/.vite`) — commit `dist/` only if you intend to serve the prebuilt static assets from the repo.
+Note: the `frontend/` directory is a separate Git repository (`sentinel-ui`). Do not accidentally push backend-only changes into the frontend repo. The upload flow now uses a review screen in `frontend/src/App.jsx` before confirm-and-ingest. When building locally, avoid committing the Vite cache (`node_modules/.vite`) — commit `dist/` only if you intend to serve the prebuilt static assets from the repo.
 
 Additional Python packages to ensure are present in `requirements.txt` for the current system:
 
@@ -447,10 +447,10 @@ Response:
 }
 ```
 
-### Ingest Document Endpoint
+### Ingest Document Flow
 
 ```http
-POST /ingest
+POST /ingest/preview
 Content-Type: multipart/form-data
 
 file: <PDF or image>
@@ -459,9 +459,23 @@ access_code: 2  # 1=Admin-only, 2=Public (visible to all tiers)
 
 Response:
 {
+  "draft": {
+    "title": "Tax_Compliance_2026_Update",
+    "description": "TDS rate on salary: 10% for income ≤ 5L, 20% for > 5L"
+  }
+}
+
+POST /ingest/confirm
+Content-Type: application/json
+
+{
+  "draft": { ...human-reviewed graph action... }
+}
+
+Response:
+{
   "message": "Policy ingested successfully",
-  "document_name": "Tax_Compliance_2026_Update",
-  "extracted_rule": "TDS rate on salary: 10% for income ≤ 5L, 20% for > 5L"
+  "document_name": "Tax_Compliance_2026_Update"
 }
 ```
 

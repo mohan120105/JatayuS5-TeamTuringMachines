@@ -706,7 +706,7 @@ ActivePolicy Schema:
 ```
 
 **Industrial Significance:**
-- **True Hybrid Search**: Mathematical fusion (vector_score + text_score/10.0) balances semantic + keyword relevance
+- **True Hybrid Search**: Reciprocal Rank Fusion (RRF) balances semantic + keyword relevance without raw-score scaling
 - **GLAC Security**: `WHERE ($user_tier = 1 OR p.access_code = 2)` enforces tier-based access
 - **Version Governance**: `WHERE (NOT only_latest) OR supersedes_count = 0` gates old policies
 - **Graceful Fallback**: If full-text index missing → vector-only query
