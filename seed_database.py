@@ -166,7 +166,10 @@ def _extract_graph_action_from_file(file_path: Path, model_name: str) -> GraphAc
     if not gemini_api_key:
         raise ValueError("GEMINI_API_KEY is missing. Add it to your environment/.env.")
 
-    client = genai.Client(api_key=gemini_api_key)
+    client = genai.Client(
+        api_key=gemini_api_key,
+        http_options=genai_types.HttpOptions(timeout=120000),
+    )
     file_bytes = file_path.read_bytes()
 
     response = client.models.generate_content(

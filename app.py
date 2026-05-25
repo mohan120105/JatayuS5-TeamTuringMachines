@@ -285,7 +285,10 @@ def render_universal_ingestion() -> None:
                     "Do not include markdown fences. Do not include extra keys."
                 )
 
-                client = genai.Client(api_key=gemini_api_key)
+                client = genai.Client(
+                    api_key=gemini_api_key,
+                    http_options=genai_types.HttpOptions(timeout=120000),
+                )
                 file_bytes = uploaded_file.read()
                 response = client.models.generate_content(
                     model="gemini-3-flash-preview",

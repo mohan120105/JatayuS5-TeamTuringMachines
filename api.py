@@ -1743,7 +1743,10 @@ def _extract_graph_action_from_upload(
     if not gemini_api_key:
         raise ValueError("GEMINI_API_KEY is missing in environment configuration.")
 
-    client = genai.Client(api_key=gemini_api_key)
+    client = genai.Client(
+        api_key=gemini_api_key,
+        http_options=genai_types.HttpOptions(timeout=120000),
+    )
     response = client.models.generate_content(
         model="gemini-3-flash-preview",
         contents=[
