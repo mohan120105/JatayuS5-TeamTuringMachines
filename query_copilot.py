@@ -422,7 +422,7 @@ def retrieve_active_policy(
             SEARCH p IN (
                 VECTOR INDEX policy_embeddings
                 FOR qe
-                LIMIT tk
+                LIMIT 25
             ) SCORE AS vector_score
             WHERE (user_tier = 1 OR p.access_code = 2) AND vector_score > similarity_threshold
             WITH p, vector_score
@@ -483,7 +483,7 @@ def retrieve_active_policy(
     SEARCH p IN (
         VECTOR INDEX policy_embeddings
         FOR $question_embedding
-        LIMIT $top_k
+        LIMIT 25
     ) SCORE AS score
     WHERE ($user_tier = 1 OR p.access_code = 2) AND score > $similarity_threshold
     OPTIONAL MATCH (superseder)-[supersedes_rel]->(p)
