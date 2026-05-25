@@ -25,7 +25,7 @@ That graph layer is the differentiator: policy nodes, customer-type edges, docum
 
 - Frontend demo: https://sentinel-ui-orpin.vercel.app/
 - Backend API: https://sentinel-hybridrag.onrender.com
-- Neo4j AuraDB: add your Aura connection screenshot and connection details here
+  
 - HuggingFace prompt modifier: https://huggingface.co/spaces/mohan1201/sentinel-gemma-router
 - HuggingFace multilingual embeddings: https://huggingface.co/spaces/mohan1201/sentinel-embedding-server
 
