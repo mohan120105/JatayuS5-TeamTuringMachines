@@ -436,10 +436,9 @@ def retrieve_active_policy(
         }
 
         CALL {
-            WITH uq, user_tier, tk
-            CALL db.index.fulltext.queryNodes('policy_keywords', uq, {limit: tk})
+            CALL db.index.fulltext.queryNodes('policy_keywords', $user_question, {limit: $top_k})
             YIELD node AS p, score AS raw_text_score
-            WHERE (user_tier = 1 OR p.access_code = 2)
+            WHERE ($user_tier = 1 OR p.access_code = 2)
             WITH p, raw_text_score
             ORDER BY raw_text_score DESC
             WITH collect({p: p, score: raw_text_score}) AS text_hits
