@@ -417,35 +417,33 @@ def retrieve_active_policy(
     cypher_query = """
     CALL {
         WITH $question_embedding AS qe, $user_question AS uq, $top_k AS tk, $user_tier AS user_tier, $similarity_threshold AS similarity_threshold
-        CALL {
-            WITH qe, user_tier, similarity_threshold
-            MATCH (p:Policy)
-            SEARCH p IN (
-                VECTOR INDEX policy_embeddings
-                FOR qe
-                LIMIT 25
-            ) SCORE AS vector_score
-            WHERE (user_tier = 1 OR p.access_code = 2) AND vector_score > similarity_threshold
-            WITH p, vector_score
-            ORDER BY vector_score DESC
-            WITH collect({p: p, score: vector_score}) AS vector_hits
-            UNWIND range(0, size(vector_hits) - 1) AS idx
-            WITH vector_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
-            RETURN p, rrf_score
 
-            UNION ALL
+        MATCH (p:Policy)
+        SEARCH p IN (
+            VECTOR INDEX policy_embeddings
+            FOR qe
+            LIMIT 25
+        ) SCORE AS vector_score
+        WHERE (user_tier = 1 OR p.access_code = 2) AND vector_score > similarity_threshold
+        WITH p, vector_score
+        ORDER BY vector_score DESC
+        WITH collect({p: p, score: vector_score}) AS vector_hits
+        UNWIND range(0, size(vector_hits) - 1) AS idx
+        WITH vector_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
+        RETURN p, rrf_score
 
-            WITH uq, user_tier, tk
-            CALL db.index.fulltext.queryNodes('policy_keywords', uq, {limit: tk})
-            YIELD node AS p, score AS raw_text_score
-            WHERE (user_tier = 1 OR p.access_code = 2)
-            WITH p, raw_text_score
-            ORDER BY raw_text_score DESC
-            WITH collect({p: p, score: raw_text_score}) AS text_hits
-            UNWIND range(0, size(text_hits) - 1) AS idx
-            WITH text_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
-            RETURN p, rrf_score
-        }
+        UNION ALL
+
+        WITH uq, user_tier, tk
+        CALL db.index.fulltext.queryNodes('policy_keywords', uq, {limit: tk})
+        YIELD node AS p, score AS raw_text_score
+        WHERE (user_tier = 1 OR p.access_code = 2)
+        WITH p, raw_text_score
+        ORDER BY raw_text_score DESC
+        WITH collect({p: p, score: raw_text_score}) AS text_hits
+        UNWIND range(0, size(text_hits) - 1) AS idx
+        WITH text_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
+        RETURN p, rrf_score
     }
     // 1. Score Fusion
     WITH p, sum(rrf_score) AS combined_score
