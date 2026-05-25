@@ -416,8 +416,9 @@ def retrieve_active_policy(
 
     cypher_query = """
     CALL {
+        WITH $question_embedding AS qe, $user_question AS uq, $top_k AS tk, $user_tier AS user_tier, $similarity_threshold AS similarity_threshold
         CALL {
-            WITH $question_embedding AS qe, $top_k AS tk, $user_tier AS user_tier, $similarity_threshold AS similarity_threshold
+            WITH qe, user_tier, similarity_threshold
             MATCH (p:Policy)
             SEARCH p IN (
                 VECTOR INDEX policy_embeddings
@@ -431,12 +432,10 @@ def retrieve_active_policy(
             UNWIND range(0, size(vector_hits) - 1) AS idx
             WITH vector_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
             RETURN p, rrf_score
-        }
 
-        UNION ALL
+            UNION ALL
 
-        CALL {
-            WITH $user_question AS uq, $top_k AS tk, $user_tier AS user_tier
+            WITH uq, user_tier, tk
             CALL db.index.fulltext.queryNodes('policy_keywords', uq, {limit: tk})
             YIELD node AS p, score AS raw_text_score
             WHERE (user_tier = 1 OR p.access_code = 2)
@@ -447,7 +446,6 @@ def retrieve_active_policy(
             WITH text_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
             RETURN p, rrf_score
         }
-        RETURN p, rrf_score
     }
     // 1. Score Fusion
     WITH p, sum(rrf_score) AS combined_score
