@@ -447,6 +447,7 @@ def retrieve_active_policy(
             WITH text_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
             RETURN p, rrf_score
         }
+        RETURN p, rrf_score
     }
     // 1. Score Fusion
     WITH p, sum(rrf_score) AS combined_score
