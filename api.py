@@ -985,7 +985,7 @@ def _fetch_github_text_file(repo_path: str) -> str:
         raise HTTPException(status_code=500, detail="Manifest content is missing.")
     try:
         decoded = base64.b64decode(encoded)
-        return decoded.decode("utf-8")
+        return decoded.decode("utf-8-sig")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Invalid manifest encoding: {exc}") from exc
 
