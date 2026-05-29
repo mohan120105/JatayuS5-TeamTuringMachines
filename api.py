@@ -61,7 +61,7 @@ except Exception as _tool_registry_error:
     _tool_registry = None
 
 try:
-    from prompt_modifier import enhance_query_for_graphrag
+    from modifier import enhance_query_for_graphrag
 except Exception as _pm_err:
     print(f"[WARNING] prompt_modifier not loaded: {_pm_err}")
     enhance_query_for_graphrag = None
