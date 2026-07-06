@@ -29,7 +29,7 @@ def enhance_query_for_graphrag(user_query: str) -> str:
                     
                     "Rewrite the user query into a clean, compact, professional retrieval string. "
                     "Only output the optimized query, nothing else."
-                    "give optimized query in users language only. Do not translate it to English. "
+                    "give optimized query in users language only. "
 
                 )
             },
