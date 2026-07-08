@@ -13,7 +13,9 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-Async%20API-009688)
 ![Streamlit](https://img.shields.io/badge/Streamlit-Web%20UI-FF4B4B)
 
-**Sentinel GraphRAG** is a production-grade conversational AI system for banking policy compliance. It combines multimodal document ingestion, hybrid vector + keyword retrieval, Neo4j graph governance, multilingual support, and deterministic audit trails to deliver hallucination-resistant, compliance-aware Q&A with full regulatory traceability.
+**Sentinel GraphRAG** is a production-grade conversational AI system for banking policy compliance. It combines multimodal document ingestion, supervisor-worker GraphRAG routing, Neo4j graph governance, multilingual support, and deterministic audit trails to deliver hallucination-resistant, compliance-aware Q&A with full regulatory traceability.
+
+The retrieval path is tuned for quality and cost: a Supervisor extracts strict ontology filters, the system retrieves only the relevant active graph evidence, and the Worker model generates the final answer from that compact context. This reduces token usage, lowers supervision overhead during response checking, and keeps evaluation runs more deterministic. If the graph route returns no rows, Sentinel falls back to the legacy hybrid path as a safety net.
 
 ## Why GraphRAG Over Standard RAG
 
@@ -52,16 +54,16 @@ That graph layer is the differentiator: policy nodes, customer-type edges, docum
 4. **Compliance Auditability**: Analysts must trace every answer to source policy + retrieval confidence → no confidence percentages in standard RAG
 5. **Multilingual Enterprise**: Banking customers span Hindi, Telugu, Tamil, etc. → responses must be localized
 
-## Sentinel Solution: Governance-First Hybrid Retrieval
+## Sentinel Solution: Supervisor-Worker GraphRAG
 
-Sentinel implements a **three-layer retrieval engine** with governance enforcement:
+Sentinel implements a **deterministic-first retrieval engine** with governance enforcement:
 
-1. **Vector Search** (HuggingFace Embedding Space): Captures semantic intent via `paraphrase-multilingual-MiniLM-L12-v2` (384-dim vectors)
-2. **Full-Text Search** (Neo4j BM25 Index): Boosts exact keyword + identifier matches (policy names, acronyms like "KYC", "TDS")
-3. **Hybrid Score Fusion**: Reciprocal Rank Fusion (RRF) over vector and BM25 ranks for balanced relevance
-4. **GLAC Access Control**: `WHERE ($user_tier = 1 OR p.access_code = 2)` enforces tier-based policy access
-5. **Version Governance**: `WHERE NOT ()-[:SUPERSEDES]->(p)` filters active policies only
-6. **Multi-Hop Resolution**: :BELONGS_TO, :APPLIES_TO, :REQUIRES edges provide customer segment + document context
+1. **Supervisor Filter Extraction**: Groq JSON-mode routing maps the user question to fixed ontology filters such as `Category`, `CustomerType`, and document names.
+2. **Deterministic Graph Retrieval**: Neo4j matches only active policy nodes that satisfy the extracted filters, keeping context small and precise.
+3. **Worker Generation**: The same Groq model is called again with only the retrieved policy text, reducing prompt size and speculative context mixing.
+4. **GLAC Access Control**: `WHERE ($user_tier = 1 OR p.access_code = 2)` enforces tier-based policy access.
+5. **Version Governance**: `WHERE NOT ()-[:SUPERSEDES]->(p)` filters active policies only.
+6. **Hybrid Safety Net**: If the exact graph route returns no records, Sentinel falls back to the legacy vector + BM25 path to avoid false no-answer failures.
 
 ## Core Features
 
@@ -72,14 +74,24 @@ Sentinel implements a **three-layer retrieval engine** with governance enforceme
 - **Ontology Guardrails**: Fixed 10-category taxonomy (Retail_Loans, Corporate_Banking, KYC_AML, Tax_Compliance, etc.) prevents hallucinated classifications
 - **Policy Lineage**: :SUPERSEDES edges track version history without hard deletes
 
-### 🔍 Hybrid Retrieval Engine
+### 🔍 Retrieval Engine
 
-- **True Hybrid Search**: Vector + BM25 score fusion for semantic + keyword relevance
+- **Supervisor-Worker Routing**: The first pass is deterministic graph filtering, not broad text retrieval.
+- **True Hybrid Fallback**: Vector + BM25 score fusion is kept as a safety net for conversational or ambiguous queries.
 - **GLAC Governance**: Employee tier-based access control (Admin: all policies, Operator: public tier-2 only)
 - **Active Policy Filtering**: Automatically excludes superseded policies from retrieval
-- **Confidence Scoring**: Raw similarity scores normalized to UI-ready percentages (0-98.5%)
-- **Fallback Robustness**: Vector-only retrieval if full-text index unavailable
+- **Confidence Scoring**: Raw similarity scores normalized to UI-ready percentages (0-98.5%) for audit display
+- **Lower Token Usage**: The Worker sees only the graph-retrieved evidence block instead of the full candidate set
+- **Fallback Robustness**: Vector-only retrieval if full-text index unavailable; hybrid fallback if the deterministic graph route returns no rows
 - **Interactive Citation Graph**: Click-to-explore evidence relationships (policy → category → customer type → required docs) via force-directed visualization
+
+### 📏 Quality & Evaluation Controls
+
+- **Reduced Supervision Overhead**: The Supervisor turns a vague question into a narrow retrieval plan, which makes response checking easier and more deterministic.
+- **Evaluation-Friendly Outputs**: Responses carry retrieval metadata and citations so you can review answer quality without rerunning the full graph search.
+- **Token-Efficient Checking**: Because the Worker only receives the retrieved policy text, evaluation and regression checks consume fewer tokens than passing broad graph context.
+- **RAGAS Lane**: The standalone `evaluation/ragas/` path can score generated answers separately from the production chat flow.
+- **Security Firewall Statuses**: The API surfaces `security_block` when input validation blocks a prompt and `verification_failed` when output grounding fails internal compliance checks.
 
 ### 🌍 Multilingual Support
 
@@ -136,19 +148,18 @@ Sentinel implements a **three-layer retrieval engine** with governance enforceme
 ┌─────────────────────────────────────────────────────────────────┐
 │  QUERY PROCESSING                                                 │
 │  1. Language Detection (FastText → langdetect)                   │
-│  2. Question Embedding (HF Spaces: paraphrase-multilingual)      │
-│  3. Hybrid Retrieval (vector + text fusion + GLAC + versioning)  │
-│  4. Retrieval Tier Classification (exact/partial/no-match)       │
+│  2. Supervisor Filter Extraction (Groq JSON mode)                │
+│  3. Deterministic Graph Retrieval (Category + CustomerType)      │
+│  4. Hybrid Fallback Only When Graph Returns No Results            │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │  RESPONSE SYNTHESIS                                               │
-│  History-aware LLM (Groq Llama-3.3-70b) + Tiered Response        │
-│  - Exact match: Direct answer                                    │
-│  - Partial match: Acknowledge gap, provide related info          │
-│  - No match: "I cannot find verified policy..."                  │
+│  Worker LLM (Groq Llama-3.3-70b) + compact retrieved context     │
+│  - Exact match: direct answer from graph evidence                 │
+│  - Partial/no-match: safety fallback or strict no-answer          │
 │  - Multilingual output in detected user language                 │
-│  - Citations with confidence scores                              │
+│  - Citations with confidence scores and route metadata            │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -658,20 +669,21 @@ System:
 | ---------------------------- | --------------- | -------------------------------------------------- |
 | Language Detection           | 10-50ms         | FastText or langdetect lookup                      |
 | Query Embedding              | 100-500ms       | HF Spaces network latency                          |
-| Hybrid Retrieval             | 50-200ms        | Neo4j vector + text index + relationship traversal |
+| Deterministic Graph Retrieval | 20-120ms        | Category + CustomerType + active policy traversal  |
+| Hybrid Fallback              | 50-200ms        | Neo4j vector + text index + relationship traversal |
 | LLM Generation               | 2-10s           | Groq Llama-3.3-70b inference                       |
 | Session History Fetch        | 10-50ms         | Neo4j last 4 messages query                        |
 | **Total E2E (cached)** | **3-12s** | Dominated by LLM inference                         |
 
 **Performance SLA Notes:**
 
-- **Query Processing (<1.5s):** Language detection + embedding + retrieval combined, excluding LLM time
+- **Query Processing (<1.5s):** Language detection + supervisor extraction + deterministic graph retrieval, excluding LLM time
 - **Follow-up Suggestion Budget:** 2.5-second hard timeout via ThreadPoolExecutor (gracefully skips if overrun)
 - **Embedding Service Timeout:** 60 seconds default; override via code if HF Spaces is congested
 - **p95/p99 Latency:** Typical p95 = 8-10s (LLM-dominated); p99 = 12-15s under load
 - **SLA Targets:**
-  - `exact_match` retrieval tier: <5s e2e (high confidence retrieval)
-  - `partial_match` retrieval tier: <12s e2e (lower confidence, suggestions included)
+  - `exact_match` retrieval tier: <5s e2e on the deterministic graph route
+  - `partial_match` retrieval tier: <12s e2e when the hybrid fallback is needed
   - `no_match`: <2s (strict no-answer fallback)
 - **Under Peak Load:** Query queuing may extend latency; consider horizontal scaling of Neo4j + API replicas
 

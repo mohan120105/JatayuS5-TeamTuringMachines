@@ -44,6 +44,8 @@ import requests
 
 from query_copilot import (
     ActivePolicy,
+    INPUT_SECURITY_WARNING_MESSAGE,
+    OUTPUT_COMPLIANCE_FAILURE_MESSAGE,
     STRICT_NO_ANSWER,
     build_embeddings_model,
     build_groq_llm,
@@ -874,11 +876,23 @@ class ChatResponse(BaseModel):
     citations: List[Citation]
     graph_nodes: List[GraphNode] = Field(default_factory=list)
     graph_edges: List[GraphEdge] = Field(default_factory=list)
-    retrieval_tier: str = Field(default="no_match")
-    sentinel_reasoning: str = Field(default="")
+    retrieval_tier: str = Field(
+        default="no_match",
+        description="Retrieval classification for the turn. Includes security_block when the input firewall blocks a request and verification_failed when the output firewall rejects an ungrounded answer.",
+    )
+    sentinel_reasoning: str = Field(
+        default="",
+        description="Human-readable explanation for the retrieval or firewall decision.",
+    )
     followup_suggestions: List[str] = Field(default_factory=list)
-    route_source: str = Field(default="graphrag")
-    route_reason: str = Field(default="")
+    route_source: str = Field(
+        default="graphrag",
+        description="High-level route used for the turn, typically graphrag or jira.",
+    )
+    route_reason: str = Field(
+        default="",
+        description="Short explanation of why the route or firewall outcome was chosen.",
+    )
 
     @model_validator(mode="after")
     def compute_match_confidence(self) -> "ChatResponse":
@@ -2350,70 +2364,86 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
                     user_tier=user_tier,
                 )
 
-                # SECURITY GUARDRAIL: The answer generator is invoked only after the
-                # retrieval tier is known, so the turn can be treated as no-match,
-                # partial, exact, or interrupted in a deterministic way.
-                retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
-                classification_tier = retrieval_tier
-
-                # Detect the operator language early so both synthesis and follow-up
-                # guidance remain aligned to the same multilingual audit trail.
-                detected_language = detect_user_language(user_question)
-
-                if user_tier != 1 and not active_context:
-                    answer = RBAC_DENIAL_MESSAGE
-                    sentinel_reasoning = RBAC_DENIAL_MESSAGE
-                    retrieval_tier = "access_denied"
-                    interrupted = False
-                else:
-                    interrupted = False
-                    sentinel_reasoning = (
-                        f"Supervisor-worker retrieval returned {len(active_context)} policy record(s)."
-                        if active_context
-                        else STRICT_NO_ANSWER
-                    )
-
-                if stop_event.is_set() or interrupted:
-                    retrieval_tier = "interrupted"
-                    answer = STOP_GENERATION_MESSAGE
-                    sentinel_reasoning = STOP_GENERATION_MESSAGE
-
-                followup_suggestions = []
-                if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match" and not stop_event.is_set():
-                    try:
-                        followup_suggestions = _build_followup_suggestions(
-                            driver,
-                            llm,
-                            embeddings,
-                            user_question,
-                            answer,
-                            active_context,
-                            detected_language,
-                            user_tier,
-                            True,
-                        )
-                    except Exception as exc:
-                        print(f"[WARNING] Follow-up suggestion path failed safely: {exc}")
-
-                # COMPLIANCE CRITICAL: No-match, denied, or interrupted turns must
-                # not expose evidence objects. Empty citations prevent speculative
-                # evidence from being rendered as if it were verified policy truth.
-                if retrieval_tier in {"no_match", "access_denied", "interrupted"} or not active_context or answer == STRICT_NO_ANSWER:
+                if answer in {INPUT_SECURITY_WARNING_MESSAGE, OUTPUT_COMPLIANCE_FAILURE_MESSAGE}:
+                    route_source = "graphrag"
+                    route_reason = answer
+                    retrieval_tier = "security_block" if answer == INPUT_SECURITY_WARNING_MESSAGE else "verification_failed"
+                    sentinel_reasoning = answer
+                    classification_tier = retrieval_tier
+                    active_context = []
                     citations = []
                     graph_nodes = []
                     graph_edges = []
+                    interrupted = False
+                    followup_suggestions = []
+                    answer = answer
+                    # Skip the normal classification/RBAC flow for security blocks.
+                    pass
                 else:
-                    citations = [
-                        Citation(
-                            document_name=p.document_name,
-                            category=p.category,
-                            raw_score=float(p.score),
-                        )
-                        for p in active_context
-                    ]
-                    graph_nodes, graph_edges = _build_evidence_graph(active_context)
+                    # SECURITY GUARDRAIL: The answer generator is invoked only after the
+                    # retrieval tier is known, so the turn can be treated as no-match,
+                    # partial, exact, or interrupted in a deterministic way.
+                    retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
+                    classification_tier = retrieval_tier
 
-                route_source = route_source or "graphrag"
+                    # Detect the operator language early so both synthesis and follow-up
+                    # guidance remain aligned to the same multilingual audit trail.
+                    detected_language = detect_user_language(user_question)
+
+                    if user_tier != 1 and not active_context:
+                        answer = RBAC_DENIAL_MESSAGE
+                        sentinel_reasoning = RBAC_DENIAL_MESSAGE
+                        retrieval_tier = "access_denied"
+                        interrupted = False
+                    else:
+                        interrupted = False
+                        sentinel_reasoning = (
+                            f"Supervisor-worker retrieval returned {len(active_context)} policy record(s)."
+                            if active_context
+                            else STRICT_NO_ANSWER
+                        )
+
+                    if stop_event.is_set() or interrupted:
+                        retrieval_tier = "interrupted"
+                        answer = STOP_GENERATION_MESSAGE
+                        sentinel_reasoning = STOP_GENERATION_MESSAGE
+
+                    followup_suggestions = []
+                    if ENABLE_FOLLOWUP_SUGGESTIONS and classification_tier == "no_match" and not stop_event.is_set():
+                        try:
+                            followup_suggestions = _build_followup_suggestions(
+                                driver,
+                                llm,
+                                embeddings,
+                                user_question,
+                                answer,
+                                active_context,
+                                detected_language,
+                                user_tier,
+                                True,
+                            )
+                        except Exception as exc:
+                            print(f"[WARNING] Follow-up suggestion path failed safely: {exc}")
+
+                    # COMPLIANCE CRITICAL: No-match, denied, or interrupted turns must
+                    # not expose evidence objects. Empty citations prevent speculative
+                    # evidence from being rendered as if it were verified policy truth.
+                    if retrieval_tier in {"no_match", "access_denied", "interrupted"} or not active_context or answer == STRICT_NO_ANSWER:
+                        citations = []
+                        graph_nodes = []
+                        graph_edges = []
+                    else:
+                        citations = [
+                            Citation(
+                                document_name=p.document_name,
+                                category=p.category,
+                                raw_score=float(p.score),
+                            )
+                            for p in active_context
+                        ]
+                        graph_nodes, graph_edges = _build_evidence_graph(active_context)
+
+                    route_source = route_source or "graphrag"
 
             # ── Step 5: Persist the new turn to Neo4j with citations (non-fatal on failure) ──────────
             try:
