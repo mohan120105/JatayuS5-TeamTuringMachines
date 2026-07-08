@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import os
+import hashlib
 from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import find_dotenv, load_dotenv
-from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from neo4j import Driver
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
-import requests
 from pydantic import BaseModel, Field
+import requests
 
 from connect import build_neo4j_driver as _build_neo4j_driver_from_connect
+from init_graph import CATEGORY_VALUES
 
 # Default model lookup paths (env override supported)
 FASTTEXT_MODEL_ENV = os.getenv("FASTTEXT_LANG_MODEL")
@@ -89,6 +91,263 @@ def ensure_fasttext_model() -> str | None:
     except Exception:
         _FASTTEXT_MODEL = None
         return None
+
+
+class SupervisorFilters(BaseModel):
+    """Strict supervisor output used to route policy retrieval."""
+
+    categories: List[str] = Field(
+        default_factory=list,
+        description="Ontology category filters selected from the fixed Sentinel category set.",
+    )
+    customer_types: List[str] = Field(
+        default_factory=list,
+        description="Customer segment filters such as NRI, MSME, or Corporate.",
+    )
+    document_names: List[str] = Field(
+        default_factory=list,
+        description="Exact policy document names when the query refers to a known policy title.",
+    )
+    required_docs: List[str] = Field(
+        default_factory=list,
+        description="Required document filters derived from the query.",
+    )
+    focus_terms: List[str] = Field(
+        default_factory=list,
+        description="Short topic phrases that help disambiguate the supervised intent.",
+    )
+    only_latest: bool = Field(
+        default=True,
+        description="Whether the retrieval should prefer only active non-superseded policy truth.",
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum number of policy rows to retrieve.",
+    )
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> List[str]:
+    """Return a stable de-duplicated list of strings."""
+
+    seen: set[str] = set()
+    cleaned: List[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return cleaned
+
+
+def _extract_json_object(raw_text: str) -> dict[str, Any]:
+    """Parse a JSON object from model output with lightweight cleanup."""
+
+    cleaned_text = (raw_text or "").strip()
+    if not cleaned_text:
+        return {}
+
+    if cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text.strip("`")
+        cleaned_text = cleaned_text.replace("json\n", "", 1).strip()
+
+    try:
+        parsed = json.loads(cleaned_text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        start_index = cleaned_text.find("{")
+        end_index = cleaned_text.rfind("}")
+        if start_index >= 0 and end_index > start_index:
+            try:
+                parsed = json.loads(cleaned_text[start_index : end_index + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _canonicalize_category(value: str) -> str | None:
+    """Map a supervisor category to the canonical ontology label."""
+
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+
+    for category in CATEGORY_VALUES:
+        if category == normalized or category.lower() == normalized.lower():
+            return category
+    return None
+
+
+def _normalize_supervisor_filters(raw_filters: dict[str, Any]) -> dict[str, Any]:
+    """Coerce supervisor JSON into the canonical filter schema."""
+
+    parsed = SupervisorFilters.model_validate(raw_filters or {})
+    categories = _dedupe_preserve_order(
+        [
+            canonical
+            for canonical in (
+                _canonicalize_category(value) for value in parsed.categories
+            )
+            if canonical is not None
+        ]
+    )
+    customer_types = _dedupe_preserve_order(parsed.customer_types)
+    document_names = _dedupe_preserve_order(parsed.document_names)
+    required_docs = _dedupe_preserve_order(parsed.required_docs)
+    focus_terms = _dedupe_preserve_order(parsed.focus_terms)
+
+    return {
+        "categories": categories,
+        "customer_types": customer_types,
+        "document_names": document_names,
+        "required_docs": required_docs,
+        "focus_terms": focus_terms,
+        "only_latest": bool(parsed.only_latest),
+        "top_k": int(parsed.top_k),
+    }
+
+
+def _invoke_llm_json(llm: ChatGroq, prompt_text: str) -> str:
+    """Invoke Groq with JSON mode when available, then return raw text."""
+
+    try:
+        runnable: Any = llm.bind(response_format={"type": "json_object"})
+        response = runnable.invoke(prompt_text)
+        content = getattr(response, "content", response)
+        return str(content).strip()
+    except Exception:
+        pass
+
+    try:
+        response = llm.invoke(prompt_text, response_format={"type": "json_object"})
+        content = getattr(response, "content", response)
+        return str(content).strip()
+    except Exception:
+        pass
+
+    response = llm.invoke(prompt_text)
+    content = getattr(response, "content", response)
+    return str(content).strip()
+
+
+def _invoke_llm_text(llm: ChatGroq, prompt_text: str) -> str:
+    """Invoke Groq and normalize the response to plain text."""
+
+    response = llm.invoke(prompt_text)
+    content = getattr(response, "content", response)
+    return str(content).strip()
+
+
+def _render_policy_context(active_context: Sequence[ActivePolicy]) -> str:
+    """Render retrieved policies into a compact worker context block."""
+
+    context_blocks: List[str] = []
+    for item in active_context:
+        context_blocks.append(
+            (
+                f"Document: {item.document_name}\n"
+                f"Category: {item.category}\n"
+                f"Applies To: {', '.join(item.customer_types) if item.customer_types else 'None'}\n"
+                f"Requires: {', '.join(item.required_docs) if item.required_docs else 'None'}\n"
+                f"Rule: {item.extracted_rule}"
+            )
+        )
+    return "\n\n".join(context_blocks)
+
+
+def _build_worker_prompt(
+    active_context: Sequence[ActivePolicy],
+    user_question: str,
+    detected_language: str,
+    high_value_instruction: str,
+) -> str:
+    """Build the worker-stage messages for grounded compliance generation."""
+
+    system_prompt = f"""
+You are the Worker stage in a Supervisor-Worker compliance pipeline.
+Answer only from the provided retrieved policy context.
+Do not browse the graph, infer missing facts, or introduce outside policy knowledge.
+If the context does not support the answer, return exactly:
+"{STRICT_NO_ANSWER}"
+
+The user's query is in {detected_language}. You must answer only in {detected_language}.
+Keep technical acronyms like TDS, KYC, NEFT, and RBI in English for regulatory clarity.
+Use the retrieved policy text as the only source of truth.
+When you quote numbers, preserve the exact numeric formatting from the context.
+{high_value_instruction}
+""".strip()
+
+    user_prompt = f"""
+Retrieved policy context:
+{_render_policy_context(active_context)}
+
+User question:
+{user_question}
+""".strip()
+
+    return f"{system_prompt}\n\n{user_prompt}"
+
+
+def supervisor_extract_filters(user_query: str, llm: ChatGroq | None = None) -> dict[str, Any]:
+    """Extract strict policy retrieval filters from the user query."""
+
+    query_text = (user_query or "").strip()
+    if not query_text:
+        return {
+            "categories": [],
+            "customer_types": [],
+            "document_names": [],
+            "required_docs": [],
+            "focus_terms": [],
+            "only_latest": True,
+            "top_k": 5,
+        }
+
+    llm_client = llm or build_groq_llm()
+
+    system_prompt = f"""
+You are Sentinel Supervisor, an intent router for a banking compliance GraphRAG.
+Your job is to convert the user query into a strict JSON object that can be used for deterministic Neo4j retrieval.
+
+Rules:
+- Output JSON only. No markdown, no commentary, no code fences.
+- Use only the fixed ontology categories below.
+- If a field is not present in the query, return an empty list for that field.
+- Do not invent document names, customer types, or categories.
+- Prefer the narrowest valid category set.
+- If the query is broad, still return the best matching category filters rather than free text.
+- Preserve original wording for customer types and document names when they are explicit.
+
+Allowed ontology categories:
+{', '.join(CATEGORY_VALUES)}
+
+Return this exact schema:
+{{
+  "categories": ["..."],
+  "customer_types": ["..."],
+  "document_names": ["..."],
+  "required_docs": ["..."],
+  "focus_terms": ["..."],
+  "only_latest": true,
+  "top_k": 5
+}}
+""".strip()
+
+    prompt_text = f"{system_prompt}\n\nUser query:\n{query_text}".strip()
+    raw_response = _invoke_llm_json(llm_client, prompt_text)
+    parsed_response = _extract_json_object(raw_response)
+    normalized = _normalize_supervisor_filters(parsed_response)
+
+    if not any(
+        normalized[field]
+        for field in ("categories", "customer_types", "document_names", "required_docs", "focus_terms")
+    ):
+        normalized.setdefault("only_latest", True)
+
+    return normalized
 
 
 
@@ -322,15 +581,6 @@ def build_groq_llm() -> ChatGroq:
     if not api_key:
         raise ValueError("GROQ_API_KEY is not set. Export it before running this script.")
 
-    # Ensure langchain global compatibility (some versions expect langchain.verbose)
-    try:
-        import langchain as _langchain
-
-        if not hasattr(_langchain, "verbose"):
-            setattr(_langchain, "verbose", False)
-    except Exception:
-        pass
-
     return ChatGroq(model="llama-3.3-70b-versatile", temperature=0, api_key=api_key)
 
 
@@ -341,10 +591,23 @@ def build_embeddings_model():
     retrieval pipeline can stay unchanged.
     """
 
+    class _FallbackEmbeddings:
+        def embed_query(self, text: str):
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            vector: list[float] = []
+            for index in range(EMBEDDING_DIM):
+                byte_value = digest[index % len(digest)]
+                vector.append(byte_value / 255.0)
+            return vector
+
     from gradio_client import Client
 
     space_name = os.getenv("HF_EMBEDDING_SPACE", "mohan1201/sentinel-embedding-server")
-    client = Client(space_name)
+    try:
+        client = Client(space_name)
+    except Exception as exc:
+        print(f"[WARNING] HF embeddings client init failed for {space_name}: {exc}. Using local fallback embeddings.")
+        return _FallbackEmbeddings()
 
     # Default to '/embed' endpoint; allow override via HF_EMBEDDING_API_NAME.
     configured_api_name = os.getenv("HF_EMBEDDING_API_NAME", "/embed").strip()
@@ -394,214 +657,109 @@ def retrieve_active_policy(
     only_latest: bool = True,
     user_tier: int = 1,
     similarity_threshold: float = 0.5,
+    supervisor_filters: dict[str, Any] | None = None,
 ) -> List[ActivePolicy]:
-    """Retrieve active policies with vector search and governance filtering.
+    """Retrieve active policies using supervisor-extracted exact filters."""
 
-    Business logic:
-    - Semantic candidate generation via Neo4j vector index on Policy.embedding.
-        - Strict governance filter excludes superseded nodes without hard-binding
-            the SUPERSEDES relationship type in the pattern.
-    - Returns evidence-ready context (rule, document name, category).
+    filters = supervisor_filters or supervisor_extract_filters(user_question)
+    normalized_filters = _normalize_supervisor_filters(filters)
 
-    Args:
-        driver: Active Neo4j driver.
-        user_question: Original user question text.
-        question_embedding: Dense embedding vector for semantic lookup.
-        top_k: Maximum number of candidate policies to return.
-        only_latest: When True, exclude policies superseded by newer versions.
+    categories = normalized_filters["categories"]
+    customer_types = normalized_filters["customer_types"]
+    document_names = normalized_filters["document_names"]
+    required_docs = normalized_filters["required_docs"]
+    focus_terms = normalized_filters["focus_terms"]
+    resolved_only_latest = bool(normalized_filters.get("only_latest", only_latest))
+    resolved_top_k = int(normalized_filters.get("top_k", top_k))
 
-    Returns:
-        List[ActivePolicy]: Ranked active-policy evidence records.
-    """
+    if not any((categories, customer_types, document_names, required_docs, focus_terms)):
+        return []
 
     cypher_query = """
-    CALL {
-        WITH $question_embedding AS qe, $user_question AS uq, $top_k AS tk, $user_tier AS user_tier, $similarity_threshold AS similarity_threshold
-
-        CALL {
-            WITH qe, user_tier, similarity_threshold
-            MATCH (p:Policy)
-            SEARCH p IN (
-                VECTOR INDEX policy_embeddings
-                FOR qe
-                LIMIT 25
-            ) SCORE AS vector_score
-            WHERE (user_tier = 1 OR p.access_code = 2) AND vector_score > similarity_threshold
-            WITH p, vector_score
-            ORDER BY vector_score DESC
-            WITH collect({p: p, score: vector_score}) AS vector_hits
-            UNWIND range(0, size(vector_hits) - 1) AS idx
-            WITH vector_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
-            RETURN collect({p: p, rrf_score: rrf_score}) AS vector_rows
-        }
-
-        CALL {
-            CALL db.index.fulltext.queryNodes('policy_keywords', $user_question, {limit: $top_k})
-            YIELD node AS p, score AS raw_text_score
-            WHERE ($user_tier = 1 OR p.access_code = 2)
-            WITH p, raw_text_score
-            ORDER BY raw_text_score DESC
-            WITH collect({p: p, score: raw_text_score}) AS text_hits
-            UNWIND range(0, size(text_hits) - 1) AS idx
-            WITH text_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
-            RETURN collect({p: p, rrf_score: rrf_score}) AS text_rows
-        }
-
-        WITH vector_rows + text_rows AS rows
-        UNWIND rows AS row
-        RETURN row.p AS p, row.rrf_score AS rrf_score
-    }
-    // 1. Score Fusion
-    WITH p, sum(rrf_score) AS combined_score
-    WHERE combined_score > 0
-
-    // 2. Governance Firewall
-    // Optionally exclude superseded nodes so only latest policy truth flows
-    // into generation and downstream compliance decisions.
-    OPTIONAL MATCH (superseder)-[supersedes_rel]->(p)
-    WHERE type(supersedes_rel) = 'SUPERSEDES'
-    WITH p, combined_score, count(supersedes_rel) AS supersedes_count, $only_latest AS only_latest
-    WHERE (NOT only_latest) OR supersedes_count = 0
-
-    OPTIONAL MATCH (p)-[:BELONGS_TO]->(c:Category)
-
-    // 3. Multi-Hop Extraction
-    OPTIONAL MATCH (p)-[:APPLIES_TO]->(ct:CustomerType)
-    OPTIONAL MATCH (p)-[:REQUIRES]->(dr:DocumentRequirement)
-    WITH p, c, combined_score, supersedes_count, collect(DISTINCT ct.name) AS customer_types, collect(DISTINCT dr.name) AS required_docs
-    RETURN p.name AS document_name,
-           coalesce(c.name, "General") AS category,
-           coalesce(p.extracted_rule, "") AS extracted_rule,
-           coalesce(p.source_text, "") AS source_text,
-           customer_types,
-           required_docs,
-            combined_score AS score,
-            CASE WHEN supersedes_count = 0 THEN "LATEST" ELSE "SUPERSEDED" END AS version_status
-    ORDER BY score DESC
-    LIMIT $top_k
-    """
-
-    vector_only_query = """
     MATCH (p:Policy)
-    SEARCH p IN (
-        VECTOR INDEX policy_embeddings
-        FOR $question_embedding
-        LIMIT 25
-    ) SCORE AS score
-    WHERE ($user_tier = 1 OR p.access_code = 2) AND score > $similarity_threshold
+    WHERE ($user_tier = 1 OR p.access_code = 2)
     OPTIONAL MATCH (superseder)-[supersedes_rel]->(p)
     WHERE type(supersedes_rel) = 'SUPERSEDES'
-    WITH p, score, count(supersedes_rel) AS supersedes_count, $only_latest AS only_latest
-    WHERE (NOT only_latest) OR supersedes_count = 0
-
     OPTIONAL MATCH (p)-[:BELONGS_TO]->(c:Category)
     OPTIONAL MATCH (p)-[:APPLIES_TO]->(ct:CustomerType)
     OPTIONAL MATCH (p)-[:REQUIRES]->(dr:DocumentRequirement)
-    WITH p, c, score, supersedes_count, collect(DISTINCT ct.name) AS customer_types, collect(DISTINCT dr.name) AS required_docs
-    RETURN p.name AS document_name,
-           coalesce(c.name, "General") AS category,
-           coalesce(p.extracted_rule, "") AS extracted_rule,
-           coalesce(p.source_text, "") AS source_text,
-           customer_types,
-           required_docs,
-            score,
-            CASE WHEN supersedes_count = 0 THEN "LATEST" ELSE "SUPERSEDED" END AS version_status
-    ORDER BY score DESC
+    WITH
+        p,
+        c,
+        collect(DISTINCT ct.name) AS customer_types,
+        collect(DISTINCT dr.name) AS required_docs,
+        count(supersedes_rel) AS supersedes_count
+    WITH
+        p,
+        c,
+        [item IN customer_types WHERE item IS NOT NULL] AS customer_types,
+        [item IN required_docs WHERE item IS NOT NULL] AS required_docs,
+        supersedes_count
+    WHERE ($only_latest = false OR supersedes_count = 0)
+      AND (size($categories) = 0 OR coalesce(c.name, "") IN $categories)
+      AND (size($customer_types) = 0 OR any(item IN customer_types WHERE item IN $customer_types))
+      AND (size($required_docs) = 0 OR any(item IN required_docs WHERE item IN $required_docs))
+      AND (size($document_names) = 0 OR any(item IN $document_names WHERE toLower(item) = toLower(p.name)))
+      AND (
+            size($focus_terms) = 0
+            OR any(term IN $focus_terms WHERE
+                toLower(coalesce(p.name, "")) CONTAINS toLower(term)
+                OR toLower(coalesce(p.extracted_rule, "")) CONTAINS toLower(term)
+                OR toLower(coalesce(p.source_text, "")) CONTAINS toLower(term)
+            )
+      )
+    WITH
+        p,
+        c,
+        customer_types,
+        required_docs,
+        supersedes_count,
+        (
+            CASE WHEN coalesce(c.name, "") IN $categories THEN 4 ELSE 0 END +
+            CASE WHEN any(item IN customer_types WHERE item IN $customer_types) THEN 3 ELSE 0 END +
+            CASE WHEN any(item IN required_docs WHERE item IN $required_docs) THEN 2 ELSE 0 END +
+            CASE WHEN any(item IN $document_names WHERE toLower(item) = toLower(p.name)) THEN 5 ELSE 0 END +
+            CASE WHEN size($focus_terms) > 0 AND any(term IN $focus_terms WHERE
+                toLower(coalesce(p.name, "")) CONTAINS toLower(term)
+                OR toLower(coalesce(p.extracted_rule, "")) CONTAINS toLower(term)
+                OR toLower(coalesce(p.source_text, "")) CONTAINS toLower(term)
+            ) THEN 1 ELSE 0 END
+        ) AS score
+    RETURN
+        p.name AS document_name,
+        coalesce(c.name, "General") AS category,
+        coalesce(p.extracted_rule, "") AS extracted_rule,
+        coalesce(p.source_text, "") AS source_text,
+        customer_types,
+        required_docs,
+        score,
+        CASE WHEN supersedes_count = 0 THEN "LATEST" ELSE "SUPERSEDED" END AS version_status
+    ORDER BY score DESC, document_name ASC
     LIMIT $top_k
     """
-
-    def _is_missing_fulltext_index(error: Neo4jError) -> bool:
-        """Detect missing full-text index errors for graceful fallback.
-
-        Args:
-            error: Neo4j exception from hybrid query execution.
-
-        Returns:
-            bool: True when the policy keyword index is unavailable.
-        """
-
-        error_text = str(error).lower()
-        return (
-            "policy_keywords" in error_text
-            and "index" in error_text
-            and (
-                "does not exist" in error_text
-                or "not found" in error_text
-                or "unknown" in error_text
-                or "there is no such" in error_text
-            )
-        )
 
     try:
         with driver.session() as session:
-            query_params = {
-                "user_question": user_question,
-                "question_embedding": [float(value) for value in question_embedding],
-                "top_k": top_k,
-                "only_latest": only_latest,
-                "user_tier": user_tier,
-                "similarity_threshold": float(similarity_threshold),
-            }
-            try:
-                records = session.execute_read(
-                    lambda tx: list(
-                        tx.run(
-                            cypher_query,
-                            **query_params,
-                        )
+            records = session.execute_read(
+                lambda tx: list(
+                    tx.run(
+                        cypher_query,
+                        user_tier=user_tier,
+                        only_latest=resolved_only_latest,
+                        top_k=resolved_top_k,
+                        categories=categories,
+                        customer_types=customer_types,
+                        document_names=document_names,
+                        required_docs=required_docs,
+                        focus_terms=focus_terms,
                     )
                 )
-            except Neo4jError as error:
-                if not _is_missing_fulltext_index(error):
-                    raise
-                print(
-                    "Full-text index 'policy_keywords' is unavailable; "
-                    "falling back to vector-only retrieval."
-                )
-                records = session.execute_read(
-                    lambda tx: list(
-                        tx.run(
-                            vector_only_query,
-                            question_embedding=query_params["question_embedding"],
-                            top_k=top_k,
-                            only_latest=only_latest,
-                            user_tier=user_tier,
-                            similarity_threshold=query_params["similarity_threshold"],
-                        )
-                    )
-                )
+            )
 
         if not records:
             return []
 
-        # Optional: filter by sentence-similarity endpoint if configured.
-        hf_sim_endpoint = os.getenv("HF_SIMILARITY_ENDPOINT")
-        hf_token = os.getenv("HF_TOKEN")
-        if hf_sim_endpoint and hf_token:
-            try:
-                sentences = [str(rec.get("source_text", "")) for rec in records]
-                payload = {"inputs": {"source_sentence": f"{user_question}", "sentences": sentences}}
-                headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
-                resp = requests.post(hf_sim_endpoint, headers=headers, json=payload, timeout=30)
-                resp.raise_for_status()
-                sim_results = resp.json()
-                filtered = []
-                for rec, score in zip(records, sim_results if isinstance(sim_results, list) else []):
-                    try:
-                        s = float(score)
-                    except Exception:
-                        if isinstance(score, dict) and "score" in score:
-                            s = float(score["score"])
-                        else:
-                            s = 0.0
-                    if s >= float(similarity_threshold):
-                        filtered.append(rec)
-                records = filtered
-            except Exception as _sim_err:
-                print(f"Similarity endpoint filtering failed: {_sim_err}")
-
         max_score = max(float(record["score"]) for record in records) if records else 0.0
-
         policies: List[ActivePolicy] = []
 
         for record in records:
@@ -640,6 +798,210 @@ def retrieve_active_policy(
         return []
 
 
+def _is_missing_fulltext_index(error: Neo4jError) -> bool:
+    """Detect missing full-text index errors for graceful fallback."""
+
+    error_text = str(error).lower()
+    return (
+        "policy_keywords" in error_text
+        and "index" in error_text
+        and (
+            "does not exist" in error_text
+            or "not found" in error_text
+            or "unknown" in error_text
+            or "there is no such" in error_text
+        )
+    )
+
+
+def _retrieve_active_policy_hybrid(
+    driver: Driver,
+    user_question: str,
+    question_embedding: Sequence[float],
+    top_k: int = 5,
+    only_latest: bool = True,
+    user_tier: int = 1,
+    similarity_threshold: float = 0.5,
+) -> List[ActivePolicy]:
+    """Fallback to the legacy hybrid vector/full-text retrieval path."""
+
+    cypher_query = """
+    CALL {
+        WITH $question_embedding AS qe, $user_question AS uq, $top_k AS tk, $user_tier AS user_tier, $similarity_threshold AS similarity_threshold
+
+        CALL {
+            WITH qe, user_tier, similarity_threshold
+            MATCH (p:Policy)
+            SEARCH p IN (
+                VECTOR INDEX policy_embeddings
+                FOR qe
+                LIMIT 25
+            ) SCORE AS vector_score
+            WHERE (user_tier = 1 OR p.access_code = 2) AND vector_score > similarity_threshold
+            WITH p, vector_score
+            ORDER BY vector_score DESC
+            WITH collect({p: p, score: vector_score}) AS vector_hits
+            UNWIND range(0, size(vector_hits) - 1) AS idx
+            WITH vector_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
+            RETURN collect({p: p, rrf_score: rrf_score}) AS vector_rows
+        }
+
+        CALL {
+            CALL db.index.fulltext.queryNodes('policy_keywords', $user_question, {limit: $top_k})
+            YIELD node AS p, score AS raw_text_score
+            WHERE ($user_tier = 1 OR p.access_code = 2)
+            WITH p, raw_text_score
+            ORDER BY raw_text_score DESC
+            WITH collect({p: p, score: raw_text_score}) AS text_hits
+            UNWIND range(0, size(text_hits) - 1) AS idx
+            WITH text_hits[idx].p AS p, (1.0 / (60.0 + idx + 1)) AS rrf_score
+            RETURN collect({p: p, rrf_score: rrf_score}) AS text_rows
+        }
+
+        WITH vector_rows + text_rows AS rows
+        UNWIND rows AS row
+        RETURN row.p AS p, row.rrf_score AS rrf_score
+    }
+    WITH p, sum(rrf_score) AS combined_score
+    WHERE combined_score > 0
+    OPTIONAL MATCH (superseder)-[supersedes_rel]->(p)
+    WHERE type(supersedes_rel) = 'SUPERSEDES'
+    WITH p, combined_score, count(supersedes_rel) AS supersedes_count, $only_latest AS only_latest
+    WHERE (NOT only_latest) OR supersedes_count = 0
+    OPTIONAL MATCH (p)-[:BELONGS_TO]->(c:Category)
+    OPTIONAL MATCH (p)-[:APPLIES_TO]->(ct:CustomerType)
+    OPTIONAL MATCH (p)-[:REQUIRES]->(dr:DocumentRequirement)
+    WITH p, c, combined_score, supersedes_count, collect(DISTINCT ct.name) AS customer_types, collect(DISTINCT dr.name) AS required_docs
+    RETURN p.name AS document_name,
+           coalesce(c.name, "General") AS category,
+           coalesce(p.extracted_rule, "") AS extracted_rule,
+           coalesce(p.source_text, "") AS source_text,
+           customer_types,
+           required_docs,
+           combined_score AS score,
+           CASE WHEN supersedes_count = 0 THEN "LATEST" ELSE "SUPERSEDED" END AS version_status
+    ORDER BY score DESC
+    LIMIT $top_k
+    """
+
+    try:
+        with driver.session() as session:
+            query_params = {
+                "user_question": user_question,
+                "question_embedding": [float(value) for value in question_embedding],
+                "top_k": top_k,
+                "only_latest": only_latest,
+                "user_tier": user_tier,
+                "similarity_threshold": float(similarity_threshold),
+            }
+            try:
+                records = session.execute_read(
+                    lambda tx: list(tx.run(cypher_query, **query_params))
+                )
+            except Neo4jError as error:
+                if not _is_missing_fulltext_index(error):
+                    raise
+                print(
+                    "Full-text index 'policy_keywords' is unavailable; falling back to vector-only retrieval."
+                )
+                vector_only_query = """
+                MATCH (p:Policy)
+                SEARCH p IN (
+                    VECTOR INDEX policy_embeddings
+                    FOR $question_embedding
+                    LIMIT 25
+                ) SCORE AS score
+                WHERE ($user_tier = 1 OR p.access_code = 2) AND score > $similarity_threshold
+                OPTIONAL MATCH (superseder)-[supersedes_rel]->(p)
+                WHERE type(supersedes_rel) = 'SUPERSEDES'
+                WITH p, score, count(supersedes_rel) AS supersedes_count, $only_latest AS only_latest
+                WHERE (NOT only_latest) OR supersedes_count = 0
+
+                OPTIONAL MATCH (p)-[:BELONGS_TO]->(c:Category)
+                OPTIONAL MATCH (p)-[:APPLIES_TO]->(ct:CustomerType)
+                OPTIONAL MATCH (p)-[:REQUIRES]->(dr:DocumentRequirement)
+                WITH p, c, score, supersedes_count, collect(DISTINCT ct.name) AS customer_types, collect(DISTINCT dr.name) AS required_docs
+                RETURN p.name AS document_name,
+                       coalesce(c.name, "General") AS category,
+                       coalesce(p.extracted_rule, "") AS extracted_rule,
+                       coalesce(p.source_text, "") AS source_text,
+                       customer_types,
+                       required_docs,
+                       score,
+                       CASE WHEN supersedes_count = 0 THEN "LATEST" ELSE "SUPERSEDED" END AS version_status
+                ORDER BY score DESC
+                LIMIT $top_k
+                """
+                records = session.execute_read(
+                    lambda tx: list(
+                        tx.run(
+                            vector_only_query,
+                            question_embedding=query_params["question_embedding"],
+                            top_k=top_k,
+                            only_latest=only_latest,
+                            user_tier=user_tier,
+                            similarity_threshold=query_params["similarity_threshold"],
+                        )
+                    )
+                )
+
+        if not records:
+            return []
+
+        hf_sim_endpoint = os.getenv("HF_SIMILARITY_ENDPOINT")
+        hf_token = os.getenv("HF_TOKEN")
+        if hf_sim_endpoint and hf_token:
+            try:
+                sentences = [str(rec.get("source_text", "")) for rec in records]
+                payload = {"inputs": {"source_sentence": f"{user_question}", "sentences": sentences}}
+                headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+                resp = requests.post(hf_sim_endpoint, headers=headers, json=payload, timeout=30)
+                resp.raise_for_status()
+                sim_results = resp.json()
+                filtered = []
+                for rec, score in zip(records, sim_results if isinstance(sim_results, list) else []):
+                    try:
+                        s = float(score)
+                    except Exception:
+                        if isinstance(score, dict) and "score" in score:
+                            s = float(score["score"])
+                        else:
+                            s = 0.0
+                    if s >= float(similarity_threshold):
+                        filtered.append(rec)
+                records = filtered
+            except Exception as _sim_err:
+                print(f"Similarity endpoint filtering failed: {_sim_err}")
+
+        max_score = max(float(record["score"]) for record in records) if records else 0.0
+        policies: List[ActivePolicy] = []
+        for record in records:
+            raw_score = float(record["score"])
+            policies.append(
+                ActivePolicy(
+                    document_name=record["document_name"],
+                    category=record["category"],
+                    customer_types=[value for value in (record.get("customer_types") or []) if value is not None],
+                    required_docs=[value for value in (record.get("required_docs") or []) if value is not None],
+                    extracted_rule=record["extracted_rule"],
+                    source_text=record["source_text"],
+                    score=raw_score,
+                    match_confidence=_normalize_match_confidence(raw_score, max_score),
+                    version_status=record["version_status"],
+                )
+            )
+        return policies
+    except ServiceUnavailable as error:
+        print(f"Neo4j connection dropped during retrieval: {error}")
+        return []
+    except Neo4jError as error:
+        print(f"Neo4j query error during retrieval: {error}")
+        return []
+    except Exception as error:
+        print(f"Unexpected retrieval error: {error}")
+        return []
+
+
 def generate_answer(
     llm: ChatGroq,
     active_context: Sequence[ActivePolicy],
@@ -647,48 +1009,13 @@ def generate_answer(
     detected_language: str = "English",
     retrieval_tier: str | None = None,
 ) -> str:
-    """Generate a grounded compliance answer from verified policy evidence.
+    """Generate a grounded compliance answer from verified policy evidence."""
 
-    Args:
-        llm: LLM client used for final answer generation.
-        active_context: Active policy evidence retrieved from Neo4j.
-        user_question: User's question text.
-        detected_language: Language name used to keep the response localized
-            for the operator.
-        retrieval_tier: Retrieval classification used to enforce the no-match
-            guardrail before synthesis.
-
-    Returns:
-        str: The grounded answer text, or the strict no-answer sentinel when
-        no verified policy context is available.
-
-    Audit Note:
-        The no-match path intentionally returns the strict sentinel instead of
-        a synthesized response. This prevents speculative evidence from being
-        emitted into the client flow and keeps GLAC-controlled retrieval
-        aligned with Stateful Auditability.
-    """
-
-    # SECURITY GUARDRAIL: A no-match retrieval tier must short-circuit before
-    # prompt construction so the model cannot invent policy evidence from an
-    # empty or unverified context.
     if not active_context or (retrieval_tier or "").strip().lower() == "no_match":
         return STRICT_NO_ANSWER
 
-    context_blocks = []
-    for item in active_context:
-        context_blocks.append(
-            (
-                f"Document: {item.document_name}\n"
-                f"Category: {item.category}\n"
-                f"Applies To: {', '.join(item.customer_types) if item.customer_types else 'None'}\n"
-                f"Requires: {', '.join(item.required_docs) if item.required_docs else 'None'}\n"
-                f"Rule: {item.extracted_rule}"
-            )
-        )
-    context_text = "\n\n".join(context_blocks)
-    
-    # Detect high-value exposures (Executive Auditor: Tier-1 Risk Flagging)
+    context_text = _render_policy_context(active_context)
+
     high_value_findings = detect_high_value_exposure(context_text)
     high_value_instruction = ""
     if high_value_findings:
@@ -696,57 +1023,20 @@ def generate_answer(
             f"**INR {finding['amount']:,.0f}** (Flagged: {finding['risk_level']})"
             for finding in high_value_findings
         )
-        high_value_instruction = f"\n\n⚠️ CRITICAL ALERT: High-value exposures detected in context: {amounts_str}\n" \
-                                "If these amounts are relevant to the user query, you MUST bold them prominently and flag as 'Critical Tier 1 Risk' in your response."
-
-    prompt = PromptTemplate.from_template(
-        """
-The user's query is in {detected_language}. You MUST answer only in
-{detected_language}; do not switch languages mid-response.
-Use the provided English context to generate a precise, Fact-Strict compliance
-response in {detected_language}.
-You MUST include specific numbers (e.g., 10%, 20% TDS rates) and Document IDs
-(e.g., AUDIT-2026-Q1-RED) found in the context. Keep technical acronyms like
-'TDS' and 'KYC' in English for regulatory clarity.
-
-You are a Strict Compliance Auditor. Your job is to extract precise, verifiable
-regulatory facts from the provided English `active_context` and present them in
-{detected_language}. Focus specifically on numeric policy values such as TDS
-rates, liquidity ratios/percentages, thresholds, fines, and durations. Use
-ONLY the provided `active_context` (which is in English) to derive facts; do
-NOT hallucinate, estimate, or invent values.
-
-[EXECUTIVE AUDITOR INSTRUCTION]:
-If you identify any financial exposure amounts exceeding ₹10 Crore (10,000,000 INR),
-you MUST:
-1. Bold the amount using **Amount** formatting
-2. Flag it as "**[CRITICAL TIER 1 RISK]**" in the response
-3. Include the source document name
-4. Preserve exact numeric formatting from the source
-
-If the context does not contain the requested fact, reply exactly:
-"I cannot find a verified active policy for this in the current database."
-
-When returning numbers, include the source document name/ID for each extracted
-fact and preserve the original numeric formatting (e.g., "8.35%", "INR 50,000").{high_value_instruction}
-
-active_context:
-{active_context}
-
-user_question:
-{user_question}
-""".strip()
-    )
+        high_value_instruction = (
+            f"\n⚠️ CRITICAL ALERT: High-value exposures detected in context: {amounts_str}\n"
+            "If these amounts are relevant to the user query, you must bold them prominently and flag them as Critical Tier 1 Risk."
+        )
 
     try:
-        formatted_prompt = prompt.format(
-            active_context=context_text,
+        prompt_text = _build_worker_prompt(
+            active_context=active_context,
             user_question=user_question,
             detected_language=detected_language,
             high_value_instruction=high_value_instruction,
         )
-        response = llm.invoke(formatted_prompt)
-        return str(response.content).strip()
+        response_text = _invoke_llm_text(llm, prompt_text)
+        return response_text or STRICT_NO_ANSWER
     except Exception as error:
         error_text = str(error)
         if "429" in error_text or "rate" in error_text.lower():
@@ -755,6 +1045,50 @@ user_question:
                 "Please retry in a few seconds."
             )
         return f"Failed to generate response from Groq: {error}"
+
+
+def run_router_worker_pipeline(
+    driver: Driver,
+    llm: ChatGroq,
+    user_question: str,
+    detected_language: str,
+    user_tier: int = 1,
+) -> tuple[dict[str, Any], List[ActivePolicy], str]:
+    """Run the full supervisor-worker pipeline end to end."""
+
+    filters = supervisor_extract_filters(user_question, llm=llm)
+    active_context = retrieve_active_policy(
+        driver=driver,
+        user_question=user_question,
+        question_embedding=[],
+        top_k=int(filters.get("top_k", 5)),
+        only_latest=bool(filters.get("only_latest", True)),
+        user_tier=user_tier,
+        supervisor_filters=filters,
+    )
+    if not active_context:
+        try:
+            fallback_embeddings = build_embeddings_model()
+            question_embedding = fallback_embeddings.embed_query(f"query: {user_question}")
+            active_context = _retrieve_active_policy_hybrid(
+                driver=driver,
+                user_question=user_question,
+                question_embedding=question_embedding,
+                top_k=int(filters.get("top_k", 5)),
+                only_latest=bool(filters.get("only_latest", True)),
+                user_tier=user_tier,
+                similarity_threshold=0.75,
+            )
+        except Exception as error:
+            print(f"Hybrid fallback retrieval failed: {error}")
+    answer = generate_answer(
+        llm=llm,
+        active_context=active_context,
+        user_question=user_question,
+        detected_language=detected_language,
+        retrieval_tier="matched" if active_context else "no_match",
+    )
+    return filters, active_context, answer
 
 
 def print_response(answer: str, active_context: Sequence[ActivePolicy]) -> None:
@@ -804,7 +1138,6 @@ def main() -> None:
 
     try:
         llm = build_groq_llm()
-        embeddings_model = build_embeddings_model()
         print("Sentinel Co-Pilot is ready. Type 'exit' to quit.")
 
         while True:
@@ -816,16 +1149,12 @@ def main() -> None:
             # Detect user's language (FastText preferred, langdetect fallback)
             detected_language = detect_user_language(user_question)
 
-            question_embedding = embeddings_model.embed_query(f"query: {user_question}")
-
-            active_context = retrieve_active_policy(
-                driver,
-                user_question,
-                question_embedding,
-                top_k=5,
-                similarity_threshold=0.75,
+            _, active_context, answer = run_router_worker_pipeline(
+                driver=driver,
+                llm=llm,
+                user_question=user_question,
+                detected_language=detected_language,
             )
-            answer = generate_answer(llm, active_context, user_question, detected_language)
             print_response(answer, active_context)
     finally:
         driver.close()

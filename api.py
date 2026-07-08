@@ -52,6 +52,7 @@ from query_copilot import (
     generate_answer,  # noqa: F401 – exported for external callers / testing
     load_environment,
     retrieve_active_policy,
+    run_router_worker_pipeline,
 )
 
 try:
@@ -63,7 +64,8 @@ except Exception as _tool_registry_error:
 try:
     from modifier import enhance_query_for_graphrag
 except Exception as _pm_err:
-    print(f"[WARNING] prompt_modifier not loaded: {_pm_err}")
+    print(f"[ERROR] prompt_modifier import failed: {_pm_err}")
+    print(f"[ERROR] HF_ROUTER_URL env var: {os.getenv('HF_ROUTER_URL', '<not set>')}")
     enhance_query_for_graphrag = None
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -104,6 +106,52 @@ GITHUB_POLICY_MANIFEST_PATH = os.getenv(
     "GITHUB_POLICY_MANIFEST_PATH",
     "policy_access_manifest.json",
 ).strip().strip("/")
+
+GEMINI_MULTIMODAL_MODEL_CANDIDATES = [
+    model
+    for model in (
+        os.getenv("GEMINI_MULTIMODAL_MODEL", "").strip(),
+        os.getenv("GEMINI_MODEL", "").strip(),
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    )
+    if model
+]
+
+
+@app.on_event("startup")
+def _startup_event() -> None:
+    """Validate critical configuration on startup.
+    
+    Logs warnings for missing optional services but allows startup to proceed.
+    This ensures container health checks don't fail while lazy initialization
+    can still attempt to load services on first use.
+    """
+    print("[INFO] Sentinel API startup sequence initiated...")
+    
+    # Check critical configuration
+    if not GITHUB_REPO or not GITHUB_TOKEN:
+        print("[WARNING] GitHub policy proxy not fully configured. Policy retrieval may fail.")
+    else:
+        print("[INFO] ✓ GitHub policy proxy configured")
+    
+    # Check optional services
+    if HF_ROUTER_URL := os.getenv("HF_ROUTER_URL", "").strip():
+        print(f"[INFO] ✓ HuggingFace router configured: {HF_ROUTER_URL[:40]}...")
+    else:
+        print("[WARNING] HF_ROUTER_URL not set. Prompt enhancement will be unavailable.")
+    
+    if not os.getenv("GROQ_API_KEY"):
+        print("[WARNING] GROQ_API_KEY not set. LLM generation will fail on first use.")
+    else:
+        print("[INFO] ✓ GROQ_API_KEY configured")
+    
+    if not os.getenv("NEO4J_URI"):
+        print("[WARNING] NEO4J_URI not set. Graph queries will fail on first use.")
+    else:
+        print("[INFO] ✓ NEO4J_URI configured")
+    
+    print("[INFO] Startup validation complete. Service ready to accept requests.")
 
 JIRA_ROUTE_KEYWORDS = {
     "jira",
@@ -744,6 +792,45 @@ def _shutdown_event() -> None:
         finally:
             _llm = None
             _embeddings = None
+
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    neo4j_available: bool
+    llm_available: bool
+    embeddings_available: bool
+    prompt_modifier_available: bool
+    jira_available: bool
+
+
+@app.get("/health", response_model=HealthResponse)
+def health_check() -> HealthResponse:
+    """Health check endpoint for container orchestration and monitoring.
+    
+    Returns operational status of all critical components without triggering
+    lazy initialization. Safe for frequent polling.
+    """
+    return HealthResponse(
+        status="healthy",
+        version="1.0.0",
+        neo4j_available=_driver is not None,
+        llm_available=_llm is not None,
+        embeddings_available=_embeddings is not None,
+        prompt_modifier_available=enhance_query_for_graphrag is not None,
+        jira_available=_tool_registry is not None,
+    )
+
+
+@app.get("/", tags=["status"])
+def root() -> dict[str, str]:
+    """Root endpoint – basic status and API info."""
+    return {
+        "service": "Sentinel Co-Pilot API",
+        "version": "1.0.0",
+        "status": "operational",
+        "docs": "/docs",
+    }
 
 
 # ── Pydantic I/O schemas ──────────────────────────────────────────────────────
@@ -1747,24 +1834,48 @@ def _extract_graph_action_from_upload(
         api_key=gemini_api_key,
         http_options=genai_types.HttpOptions(timeout=120000),
     )
-    response = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=[
-            genai_types.Content(
-                role="user",
-                parts=[
-                    genai_types.Part.from_bytes(
-                        data=file_bytes,
-                        mime_type=mime_type,
-                    ),
-                    genai_types.Part.from_text(text=_UPLOAD_PROMPT),
+
+    last_error: Exception | None = None
+    response = None
+    for model_name in GEMINI_MULTIMODAL_MODEL_CANDIDATES:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    genai_types.Content(
+                        role="user",
+                        parts=[
+                            genai_types.Part.from_bytes(
+                                data=file_bytes,
+                                mime_type=mime_type,
+                            ),
+                            genai_types.Part.from_text(text=_UPLOAD_PROMPT),
+                        ],
+                    )
                 ],
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                ),
             )
-        ],
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json"
-        ),
-    )
+            break
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            location_error = (
+                "FAILED_PRECONDITION" in error_text
+                or "User location is not supported for the API use" in error_text
+                or "location is not supported" in error_text.lower()
+            )
+            if location_error and model_name != GEMINI_MULTIMODAL_MODEL_CANDIDATES[-1]:
+                continue
+            raise ValueError(
+                f"Gemini extraction failed for {filename} using model '{model_name}': {exc}"
+            ) from exc
+
+    if response is None:
+        raise ValueError(
+            f"Gemini extraction failed for {filename}: {last_error or 'no multimodal model candidates configured.'}"
+        )
 
     response_text = (response.text or "").strip()
     if not response_text:
@@ -2104,17 +2215,28 @@ def enhance_prompt(request: EnhanceRequest) -> EnhanceResponse:
         raise HTTPException(status_code=422, detail="user_input must not be empty.")
 
     if enhance_query_for_graphrag is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Local prompt enhancement model is unavailable on this server.",
+        error_detail = (
+            "Prompt modifier not initialized. "
+            "Check: (1) HF_ROUTER_URL environment variable is set, "
+            "(2) prompt_modifier.py can be imported, "
+            "(3) HuggingFace Spaces endpoint is reachable."
         )
+        print(f"[ERROR] {error_detail}")
+        raise HTTPException(status_code=503, detail=error_detail)
 
     try:
         enhanced_prompt = enhance_query_for_graphrag(user_input).strip()
-    except Exception as exc:
+    except RuntimeError as exc:
+        print(f"[ERROR] Prompt enhancement failed: {exc}")
         raise HTTPException(
             status_code=503,
-            detail=f"Local prompt enhancement failed: {exc}",
+            detail=f"Prompt enhancement failed: {str(exc)}",
+        ) from exc
+    except Exception as exc:
+        print(f"[ERROR] Unexpected prompt enhancement error: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Prompt enhancement error: {str(exc)}",
         ) from exc
 
     return EnhanceResponse(enhanced_prompt=enhanced_prompt or user_input)
@@ -2220,23 +2342,11 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
                 interrupted = False
                 followup_suggestions = []
             else:
-                # COMPLIANCE CRITICAL: Retrieval must stay fully grounded before any
-                # response is emitted. The hybrid search path combines lexical and
-                # vector evidence, then applies GLAC and policy access filtering.
-                try:
-                    question_embedding = embeddings.embed_query(f"query: {user_question}")
-                except Exception as exc:
-                    # Embedding failures (network, auth, model errors) should return a
-                    # controlled 503 to the client rather than raising an uncaught 500.
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Embedding service unavailable: {exc}",
-                    ) from exc
-
-                active_context = retrieve_active_policy(
-                    driver,
-                    user_question,
-                    question_embedding,
+                _, active_context, answer = run_router_worker_pipeline(
+                    driver=driver,
+                    llm=llm,
+                    user_question=user_question,
+                    detected_language=detect_user_language(user_question),
                     user_tier=user_tier,
                 )
 
@@ -2256,15 +2366,11 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
                     retrieval_tier = "access_denied"
                     interrupted = False
                 else:
-                    answer, sentinel_reasoning, interrupted = await run_in_threadpool(
-                        _generate_with_history,
-                        llm,
-                        active_context,
-                        user_question,
-                        history,
-                        retrieval_tier,
-                        detected_language,
-                        stop_event,
+                    interrupted = False
+                    sentinel_reasoning = (
+                        f"Supervisor-worker retrieval returned {len(active_context)} policy record(s)."
+                        if active_context
+                        else STRICT_NO_ANSWER
                     )
 
                 if stop_event.is_set() or interrupted:
