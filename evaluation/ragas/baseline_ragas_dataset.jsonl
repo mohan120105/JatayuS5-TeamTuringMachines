@@ -1,5 +1,17 @@
-{"id":"kyc_pan_cash_deposit","question":"What is the PAN requirement for a single branch cash deposit under the 2024 KYC/AML baseline?","reference_answer":"Any single cash deposit exceeding INR 100,000 must be accompanied by a verified PAN card. Deposits below that threshold do not require PAN capture.","contexts":["Rule: Any single cash deposit exceeding INR 100,000 at a branch counter must be accompanied by a verified PAN card. Deposits below this threshold do not require PAN capture."],"source_documents":["KYC_AML_PAN_Baseline_2024.pdf"],"topic":"KYC_AML","question_type":"factoid","notes":"Single-threshold compliance lookup."}
+{
+    "id":
+    "kyc_pan_cash_deposit",
+    "question":"What is the PAN requirement for a single branch cash deposit under the 2024 KYC/AML baseline?",
+    "reference_answer":"Any single cash deposit exceeding INR 100,000 must be accompanied by a verified PAN card. Deposits below that threshold do not require PAN capture.",
+    "contexts":["Rule: Any single cash deposit exceeding INR 100,000 at a branch counter must be accompanied by a verified PAN card. Deposits below this threshold do not require PAN capture."],
+    "source_documents":["KYC_AML_PAN_Baseline_2024.pdf"],
+    "topic":"KYC_AML",
+    "question_type":"factoid",
+    "notes":"Single-threshold compliance lookup."
+}
+
 {"id":"fd_tds_general","question":"When does TDS apply to FD interest for general customers in the retail deposit policy?","reference_answer":"TDS applies at 10% when total fixed deposit interest exceeds INR 40,000 in a single financial year.","contexts":["General Public: TDS is applicable at 10% if the total interest earned in a financial year exceeds INR 40,000.","A TDS rate of 10% will be automatically deducted on interest earned from Fixed Deposits if the total interest exceeds INR 40,000 in a single financial year."],"source_documents":["Retail_Deposit_Policy_2026.pdf","Tax_Compliance_TDS_2024.pdf"],"topic":"Tax_Compliance","question_type":"factoid","notes":"Grounded FD tax threshold question."}
+
 {"id":"fd_tds_senior","question":"What is the TDS threshold for senior citizens on fixed deposit interest?","reference_answer":"Senior citizens are taxed at 10% only on the interest amount that exceeds INR 50,000 in a financial year.","contexts":["Senior Citizens (Age 60+): The exemption limit is extended. TDS is applicable at 10% only on the interest amount that exceeds INR 50,000 in a financial year."],"source_documents":["Retail_Deposit_Policy_2026.pdf"],"topic":"Tax_Compliance","question_type":"factoid","notes":"Senior citizen exemption lookup."}
 {"id":"fd_special_444_days","question":"What are the 444-day Sentinel Super Saver FD rates in 2026?","reference_answer":"The 444-day Sentinel Super Saver pays 7.40% for general customers and 7.90% for senior citizens.","contexts":["\"Sentinel Super Saver\" (444 Days): 7.40% (General) | 7.90% (Senior Citizen)."],"source_documents":["FD_Interest_Rates_2026.pdf"],"topic":"Deposits","question_type":"numeric","notes":"Special tenor rate lookup."}
 {"id":"fd_premature_withdrawal_penalty","question":"What penalty applies to premature withdrawal of term deposits?","reference_answer":"A flat 1.00% penalty is deducted from the effective interest rate for premature withdrawal.","contexts":["A flat penalty of 1.00% will be deducted from the effective interest rate for any premature withdrawal of term deposits."],"source_documents":["Retail_Deposit_Policy_2026.pdf"],"topic":"Deposits","question_type":"factoid","notes":"Penalty computation question."}
