@@ -33,6 +33,18 @@ SUPPORTED_EXTENSIONS = {".pdf", ".png"}
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 RATE_LIMIT_SECONDS = 3
 
+GEMINI_MULTIMODAL_MODEL_CANDIDATES = [
+    model
+    for model in (
+        os.getenv("GEMINI_MULTIMODAL_MODEL", "").strip(),
+        os.getenv("GEMINI_MODEL", "").strip(),
+        DEFAULT_GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    )
+    if model
+]
+
 # --- THE BOUNCER: Absolute Source of Truth for Ontology ---
 APPROVED_CATEGORIES = {
     "Retail_Loans",
@@ -172,22 +184,50 @@ def _extract_graph_action_from_file(file_path: Path, model_name: str) -> GraphAc
     )
     file_bytes = file_path.read_bytes()
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            genai_types.Content(
-                role="user",
-                parts=[
-                    genai_types.Part.from_bytes(
-                        data=file_bytes,
-                        mime_type=_mime_type_for(file_path),
-                    ),
-                    genai_types.Part.from_text(text=_build_prompt()),
+    candidate_models = [
+        candidate
+        for candidate in [model_name, *GEMINI_MULTIMODAL_MODEL_CANDIDATES]
+        if candidate
+    ]
+    response = None
+    last_error: Exception | None = None
+    for candidate_model in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=candidate_model,
+                contents=[
+                    genai_types.Content(
+                        role="user",
+                        parts=[
+                            genai_types.Part.from_bytes(
+                                data=file_bytes,
+                                mime_type=_mime_type_for(file_path),
+                            ),
+                            genai_types.Part.from_text(text=_build_prompt()),
+                        ],
+                    )
                 ],
+                config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
             )
-        ],
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+            break
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            location_error = (
+                "FAILED_PRECONDITION" in error_text
+                or "User location is not supported for the API use" in error_text
+                or "location is not supported" in error_text.lower()
+            )
+            if location_error and candidate_model != candidate_models[-1]:
+                continue
+            raise ValueError(
+                f"Gemini extraction failed for {file_path.name} using model '{candidate_model}': {exc}"
+            ) from exc
+
+    if response is None:
+        raise ValueError(
+            f"Gemini extraction failed for {file_path.name}: {last_error or 'no multimodal model candidates configured.'}"
+        )
 
     response_text = (response.text or "").strip()
     if not response_text:

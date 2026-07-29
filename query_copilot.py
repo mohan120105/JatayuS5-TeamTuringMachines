@@ -389,38 +389,66 @@ def detect_high_value_exposure(text: str, threshold: int = HIGH_VALUE_EXPOSURE_T
         return []
     
     findings = []
+    seen_spans = set()
     
-    # Regex patterns for INR amounts with various formats
-    patterns = [
-        r'[₹]\s*([0-9,]+(?:\.[0-9]{2})?)',  # ₹ symbol
-        r'INR\s+([0-9,]+(?:\.[0-9]{2})?)',  # INR prefix
-        r'Rs\.?\s+([0-9,]+(?:\.[0-9]{2})?)',  # Rs. or Rs prefix
-        r'Cr(?:ore)?\s+([0-9,]+(?:\.[0-9]{2})?)',  # Crore amounts
-    ]
+    # 1. Patterns with explicit units (Crore, Lakh, Million, etc.)
+    unit_pattern = re.compile(
+        r'(?:₹|INR|Rs\.?|Rupees)?\s*([0-9,]+(?:\.[0-9]+)?)\s*(Cr(?:ore)?s?|Lakhs?|Lacs?|Millions?|Mn)\b',
+        re.IGNORECASE
+    )
     
-    for pattern in patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
-        for match in matches:
-            amount_str = match.group(1).replace(',', '')
-            try:
-                amount = float(amount_str)
+    for match in unit_pattern.finditer(text):
+        try:
+            val_str = match.group(1).replace(',', '')
+            num = float(val_str)
+            unit = match.group(2).lower()
+            
+            if 'cr' in unit:
+                amount = num * 10_000_000
+            elif 'lakh' in unit or 'lac' in unit:
+                amount = num * 100_000
+            elif 'million' in unit or unit == 'mn':
+                amount = num * 1_000_000
+            else:
+                amount = num
                 
-                # Scale crore amounts to base INR
-                if 'crore' in match.group(0).lower() or 'cr' in match.group(0).lower():
-                    amount = amount * 10_000_000
-                
-                if amount >= threshold:
-                    risk_level = 'CRITICAL_TIER_1' if amount >= threshold else 'WARNING'
-                    findings.append({
-                        'amount': amount,
-                        'raw_text': match.group(0),
-                        'risk_level': risk_level,
-                        'position': match.start(),
-                    })
-            except (ValueError, TypeError):
-                continue
+            if amount >= threshold:
+                span = (match.start(), match.end())
+                seen_spans.add(span)
+                findings.append({
+                    'amount': amount,
+                    'raw_text': match.group(0).strip(),
+                    'risk_level': 'CRITICAL_TIER_1',
+                    'position': match.start(),
+                })
+        except (ValueError, TypeError):
+            continue
+
+    # 2. Currency symbol prefix with comma-separated numbers (Indian or Western style)
+    currency_pattern = re.compile(
+        r'(?:₹|\u20b9|INR|Rs\.?|Rupees)?\s*([0-9][0-9,]{5,}(?:\.[0-9]{1,2})?)(?:/-)?',
+        re.IGNORECASE
+    )
     
-    return sorted(findings, key=lambda x: x['position'], reverse=True)  # Sort descending by position
+    for match in currency_pattern.finditer(text):
+        # Skip if already captured by unit pattern
+        if any(s[0] <= match.start() < s[1] for s in seen_spans):
+            continue
+        try:
+            val_str = match.group(1).replace(',', '')
+            amount = float(val_str)
+            if amount >= threshold:
+                findings.append({
+                    'amount': amount,
+                    'raw_text': match.group(0).strip(),
+                    'risk_level': 'CRITICAL_TIER_1',
+                    'position': match.start(),
+                })
+        except (ValueError, TypeError):
+            continue
+
+    return sorted(findings, key=lambda x: x['position'], reverse=True)
+
 
 
 class ActivePolicy(BaseModel):
@@ -901,7 +929,7 @@ def _retrieve_active_policy_hybrid(
     top_k: int = 5,
     only_latest: bool = True,
     user_tier: int = 1,
-    similarity_threshold: float = 0.5,
+    similarity_threshold: float = 0.55,
 ) -> List[ActivePolicy]:
     """Fallback to the legacy hybrid vector/full-text retrieval path."""
 
@@ -911,12 +939,8 @@ def _retrieve_active_policy_hybrid(
 
         CALL {
             WITH qe, user_tier, similarity_threshold
-            MATCH (p:Policy)
-            SEARCH p IN (
-                VECTOR INDEX policy_embeddings
-                FOR qe
-                LIMIT 25
-            ) SCORE AS vector_score
+            CALL db.index.vector.queryNodes('policy_embeddings', 25, qe)
+            YIELD node AS p, score AS vector_score
             WHERE (user_tier = 1 OR p.access_code = 2) AND vector_score > similarity_threshold
             WITH p, vector_score
             ORDER BY vector_score DESC
@@ -1161,7 +1185,7 @@ def run_router_worker_pipeline(
                 top_k=int(filters.get("top_k", 5)),
                 only_latest=bool(filters.get("only_latest", True)),
                 user_tier=user_tier,
-                similarity_threshold=0.75,
+                similarity_threshold=0.55,
             )
         except Exception as error:
             print(f"Hybrid fallback retrieval failed: {error}")

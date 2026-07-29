@@ -9,9 +9,20 @@ This script bootstraps the foundational graph for Sentinel GraphRAG by:
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Sequence
+
+try:
+    import langchain as _langchain
+
+    if not hasattr(_langchain, "verbose"):
+        setattr(_langchain, "verbose", False)
+    if not hasattr(_langchain, "debug"):
+        setattr(_langchain, "debug", False)
+except Exception:
+    pass
 
 from langchain_groq import ChatGroq
 from neo4j import Driver, GraphDatabase
@@ -395,19 +406,13 @@ def build_groq_llm() -> ChatGroq:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise ValueError("GROQ_API_KEY is not set. Export it before running this script.")
-    # Ensure older/newer langchain packages don't fail due to missing globals
+    # Keep the builder resilient even if a downstream import expects langchain globals.
     try:
         import langchain as _langchain
 
-        if not hasattr(_langchain, "verbose"):
-            setattr(_langchain, "verbose", False)
-        if not hasattr(_langchain, "debug"):
-            setattr(_langchain, "debug", False)
         if not hasattr(_langchain, "llm_cache"):
             setattr(_langchain, "llm_cache", None)
     except Exception:
-        # Best-effort: ignore if langchain import fails here; the ChatGroq
-        # constructor will raise a clear error about missing deps.
         pass
 
     return ChatGroq(
@@ -420,8 +425,21 @@ def build_groq_llm() -> ChatGroq:
 def build_embeddings_model() -> Any:
     """Create embeddings client using the remote Gradio Space service."""
 
+    class _FallbackEmbeddings:
+        def embed_query(self, text: str):
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            vector: list[float] = []
+            for index in range(EMBEDDING_DIM):
+                byte_value = digest[index % len(digest)]
+                vector.append(byte_value / 255.0)
+            return vector
+
     space_name = os.getenv("HF_EMBEDDING_SPACE", "mohan1201/sentinel-embedding-server")
-    client = Client(space_name)
+    try:
+        client = Client(space_name)
+    except Exception as exc:
+        print(f"[WARNING] HF embeddings client init failed for {space_name}: {exc}. Using local fallback embeddings.")
+        return _FallbackEmbeddings()
 
     # Default to '/embed' endpoint; allow override via HF_EMBEDDING_API_NAME.
     configured_api_name = os.getenv("HF_EMBEDDING_API_NAME", "/embed").strip()

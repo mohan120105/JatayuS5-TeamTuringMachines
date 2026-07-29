@@ -43,6 +43,17 @@ QUESTION_STOPWORDS: Set[str] = {
     "that",
     "please",
 }
+
+GEMINI_MULTIMODAL_MODEL_CANDIDATES = [
+    model
+    for model in (
+        os.getenv("GEMINI_MULTIMODAL_MODEL", "").strip(),
+        os.getenv("GEMINI_MODEL", "").strip(),
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    )
+    if model
+]
 @st.cache_resource(show_spinner=False)
 def get_cached_driver() -> Driver:
     """Create and cache Neo4j driver for low-latency Streamlit interactions."""
@@ -290,24 +301,45 @@ def render_universal_ingestion() -> None:
                     http_options=genai_types.HttpOptions(timeout=120000),
                 )
                 file_bytes = uploaded_file.read()
-                response = client.models.generate_content(
-                    model="gemini-3-flash-preview",
-                    contents=[
-                        genai_types.Content(
-                            role="user",
-                            parts=[
-                                genai_types.Part.from_bytes(
-                                    data=file_bytes,
-                                    mime_type=uploaded_file.type or "application/octet-stream",
-                                ),
-                                genai_types.Part.from_text(text=prompt),
+                last_error: Exception | None = None
+                response = None
+                for model_name in GEMINI_MULTIMODAL_MODEL_CANDIDATES:
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=[
+                                genai_types.Content(
+                                    role="user",
+                                    parts=[
+                                        genai_types.Part.from_bytes(
+                                            data=file_bytes,
+                                            mime_type=uploaded_file.type or "application/octet-stream",
+                                        ),
+                                        genai_types.Part.from_text(text=prompt),
+                                    ],
+                                )
                             ],
+                            config=genai_types.GenerateContentConfig(
+                                response_mime_type="application/json"
+                            ),
                         )
-                    ],
-                    config=genai_types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    ),
-                )
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        error_text = str(exc)
+                        location_error = (
+                            "FAILED_PRECONDITION" in error_text
+                            or "User location is not supported for the API use" in error_text
+                            or "location is not supported" in error_text.lower()
+                        )
+                        if location_error and model_name != GEMINI_MULTIMODAL_MODEL_CANDIDATES[-1]:
+                            continue
+                        raise
+
+                if response is None:
+                    raise RuntimeError(
+                        f"Gemini extraction failed: {last_error or 'no multimodal model candidates configured.'}"
+                    )
 
                 response_text = (response.text or "").strip()
                 if response_text.startswith("```"):

@@ -22,8 +22,12 @@ import time
 
 import requests
 
-HF_ROUTER_URL = os.getenv("HF_ROUTER_URL")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+HF_ROUTER_URL = os.getenv("HF_ROUTER_URL", "https://mohan1201-sentinel-gemma-router.hf.space/optimize_prompt").strip() or None
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", "").strip() or None
+
+if not HF_ROUTER_URL:
+    import sys
+    print(f"[WARNING] HF_ROUTER_URL not configured. Prompt enhancement disabled.", file=sys.stderr)
 
 def enhance_query_for_graphrag(user_query: str) -> str:
     """Rewrite user input into a retrieval-optimized GraphRAG query string.
@@ -39,30 +43,44 @@ def enhance_query_for_graphrag(user_query: str) -> str:
         str: A compact, professional query phrasing suitable for downstream
         retrieval and ranking.
 
-    Raises:
-        RuntimeError: If the router URL is not configured or the router call
-        fails.
+    Falls back to the original user query when the router is unavailable,
+    slow, or returns an unexpected payload.
     """
     if not HF_ROUTER_URL:
-        raise RuntimeError("HF_ROUTER_URL is not set. Configure the Hugging Face router endpoint.")
+        error_msg = "HF_ROUTER_URL environment variable is not set. Returning the original query."
+        print(f"[WARNING] {error_msg}")
+        return user_query.strip()
 
     start_time = time.time()
     headers = {"Content-Type": "application/json"}
     if HF_API_TOKEN:
         headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
 
-    response = requests.post(
-        HF_ROUTER_URL,
-        json={"prompt": user_query},
-        headers=headers,
-        timeout=60,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            HF_ROUTER_URL,
+            json={"prompt": user_query},
+            headers=headers,
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        error_msg = f"HuggingFace router request failed (URL: {HF_ROUTER_URL}): {exc}"
+        print(f"[WARNING] {error_msg}. Returning the original query.")
+        return user_query.strip()
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except Exception as exc:
+        error_msg = f"HuggingFace router response is not valid JSON: {exc}"
+        print(f"[WARNING] {error_msg}. Returning the original query.")
+        return user_query.strip()
+
     optimized_query = payload.get("optimized_query")
     if not optimized_query:
-        raise RuntimeError("HF router response did not include optimized_query.")
+        error_msg = f"HuggingFace router response missing 'optimized_query' field. Got: {payload}"
+        print(f"[WARNING] {error_msg}. Returning the original query.")
+        return user_query.strip()
 
     print(f"⚡ Modifier ran in {round(time.time() - start_time, 2)}s")
     return str(optimized_query).strip()

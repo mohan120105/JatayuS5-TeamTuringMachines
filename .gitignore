@@ -36,3 +36,9 @@ dist/
 # Streamlit cache and logs
 .streamlit/
 *.log
+
+# Nexus context database
+.nexus_context.db*
+sentinel-ui-frontend/
+hybridrag-*.json
+*.json.secret

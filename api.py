@@ -702,6 +702,11 @@ def _build_followup_suggestions(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+_driver_lock = threading.Lock()
+_llm_lock = threading.Lock()
+_embeddings_lock = threading.Lock()
+
+
 def _get_driver() -> Driver:
     """Return a cached Neo4j driver singleton.
 
@@ -713,7 +718,9 @@ def _get_driver() -> Driver:
     """
     global _driver
     if _driver is None:
-        _driver = build_neo4j_driver()
+        with _driver_lock:
+            if _driver is None:
+                _driver = build_neo4j_driver()
     return _driver
 
 
@@ -725,7 +732,9 @@ def _get_llm():
     """
     global _llm
     if _llm is None:
-        _llm = build_groq_llm()
+        with _llm_lock:
+            if _llm is None:
+                _llm = build_groq_llm()
     return _llm
 
 
@@ -737,23 +746,46 @@ def _get_embeddings():
     """
     global _embeddings
     if _embeddings is None:
-        _embeddings = build_embeddings_model()
+        with _embeddings_lock:
+            if _embeddings is None:
+                _embeddings = build_embeddings_model()
     return _embeddings
 
 
-def get_user_tier(employee_id: str) -> int:
-    """Map an employee identifier prefix to the Sentinel access tier.
+def get_user_tier(employee_id: str, auth_header: str | None = None) -> int:
+    """Map an employee identifier or JWT auth header to the Sentinel access tier.
 
-    Tier mapping is intentionally prefix-based so the UI can enforce a simple
-    operator identity gate without requiring a separate identity provider.
+    Supports JWT Bearer token claims ('role' / 'tier') when provided in Authorization header,
+    with fallback to employee_id prefix mapping for backwards compatibility.
 
     Args:
         employee_id: Employee identifier provided by the operator.
+        auth_header: Optional HTTP Authorization header (e.g., Bearer <jwt>).
 
     Returns:
         int: 1 for Admin, 2 for Operator, 3 for Viewer.
     """
+    # 1. Attempt JWT Bearer token parsing if provided
+    if auth_header and auth_header.strip().lower().startswith("bearer "):
+        token = auth_header.strip()[7:].strip()
+        try:
+            # Decode JWT payload unverified/verified base64 segment
+            parts = token.split(".")
+            if len(parts) == 3:
+                padding = "=" * (4 - len(parts[1]) % 4)
+                payload_bytes = base64.urlsafe_b64decode(parts[1] + padding)
+                payload = json.loads(payload_bytes.decode("utf-8"))
+                role = str(payload.get("role", "") or payload.get("tier", "")).lower()
+                if "admin" in role or role in {"1", "tier1", "tier_1"}:
+                    return 1
+                if "operator" in role or role in {"2", "tier2", "tier_2"}:
+                    return 2
+                if "viewer" in role or role in {"3", "tier3", "tier_3"}:
+                    return 3
+        except Exception:
+            pass  # Fall back to prefix matching if token format is custom
 
+    # 2. Fallback to employee prefix matching
     normalized_employee_id = (employee_id or "").strip()
     if normalized_employee_id.startswith("1"):
         return 1
@@ -2300,7 +2332,7 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     if not employee_id:
         raise HTTPException(status_code=422, detail="employee_id must not be empty.")
 
-    user_tier = get_user_tier(employee_id)
+    user_tier = get_user_tier(employee_id, request.headers.get("authorization"))
 
     driver = _get_driver()
     llm = _get_llm()
@@ -2356,7 +2388,8 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
                 interrupted = False
                 followup_suggestions = []
             else:
-                _, active_context, answer = run_router_worker_pipeline(
+                _, active_context, answer = await run_in_threadpool(
+                    run_router_worker_pipeline,
                     driver=driver,
                     llm=llm,
                     user_question=user_question,
@@ -2487,6 +2520,97 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
             await disconnect_task
         except asyncio.CancelledError:
             pass
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request, payload: ChatRequest) -> StreamingResponse:
+    """Stream GraphRAG response tokens via Server-Sent Events (SSE).
+
+    Args:
+        request: FastAPI request.
+        payload: ChatRequest with session_id, user_question, employee_id.
+
+    Returns:
+        StreamingResponse with text/event-stream content.
+    """
+    session_id = payload.session_id.strip()
+    user_question = payload.user_question.strip()
+    employee_id = payload.employee_id.strip()
+
+    if not session_id or not user_question or not employee_id:
+        raise HTTPException(status_code=422, detail="session_id, user_question, and employee_id must not be empty.")
+
+    user_tier = get_user_tier(employee_id, request.headers.get("authorization"))
+    driver = _get_driver()
+    llm = _get_llm()
+
+    async def event_generator():
+        try:
+            route_source, route_reason = _classify_chat_route(user_question)
+            if route_source == "jira":
+                answer, route_reason = await run_in_threadpool(_run_jira_search, user_question)
+                yield f"data: {json.dumps({'chunk': answer, 'event': 'content'})}\n\n"
+                done_meta = {
+                    "event": "done",
+                    "answer": answer,
+                    "citations": [],
+                    "retrieval_tier": "tool_call",
+                    "sentinel_reasoning": route_reason,
+                    "route_source": route_source,
+                    "route_reason": route_reason,
+                }
+                yield f"data: {json.dumps(done_meta)}\n\n"
+                return
+
+            filters, active_context, full_answer = await run_in_threadpool(
+                run_router_worker_pipeline,
+                driver=driver,
+                llm=llm,
+                user_question=user_question,
+                detected_language=detect_user_language(user_question),
+                user_tier=user_tier,
+            )
+
+            # Stream answer tokens to the SSE client
+            chunk_size = 12
+            for i in range(0, len(full_answer), chunk_size):
+                chunk = full_answer[i : i + chunk_size]
+                yield f"data: {json.dumps({'chunk': chunk, 'event': 'content'})}\n\n"
+                await asyncio.sleep(0.01)
+
+            retrieval_tier, sentinel_reasoning = _classify_context_tier(user_question, active_context)
+            graph_nodes, graph_edges = _build_evidence_graph(user_question, active_context)
+            citations = [
+                Citation(
+                    document_name=item.document_name,
+                    category=item.category,
+                    customer_types=item.customer_types,
+                    required_docs=item.required_docs,
+                    extracted_rule=item.extracted_rule,
+                    match_confidence=item.match_confidence,
+                    version_status=item.version_status,
+                ).model_dump()
+                for item in active_context
+            ]
+
+            done_payload = {
+                "event": "done",
+                "answer": full_answer,
+                "citations": citations,
+                "graph_nodes": [node.model_dump() for node in graph_nodes],
+                "graph_edges": [edge.model_dump() for edge in graph_edges],
+                "retrieval_tier": retrieval_tier,
+                "sentinel_reasoning": sentinel_reasoning,
+                "route_source": route_source,
+                "route_reason": route_reason,
+            }
+            yield f"data: {json.dumps(done_payload)}\n\n"
+
+        except Exception as exc:
+            err_payload = {"event": "error", "error": str(exc)}
+            yield f"data: {json.dumps(err_payload)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/ingest", response_model=UploadResponse)
